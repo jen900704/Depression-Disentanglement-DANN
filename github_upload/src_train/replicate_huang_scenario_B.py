@@ -72,7 +72,7 @@ EVAL_STEPS = 50
 SAVE_STEPS = 50
 LOGGING_STEPS = 50
 SAVE_TOTAL_LIMIT = 3
-WARMUP_RATIO = 0.1
+# WARMUP_RATIO 已移除 — 對齊 train.py (File 7)，預設為 0 warmup steps
 
 # Label 對照表
 LABEL_MAP = {"non": 0, "0": 0, 0: 0, "dep": 1, "1": 1, 1: 1}
@@ -235,8 +235,8 @@ class DataCollatorCTCWithPadding:
 
 def compute_metrics(p: EvalPrediction):
     preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
-    preds = np.argmax(preds, axis=1)
-    acc = accuracy_score(p.label_ids, preds)
+    preds = np.argmax(preds, axis=1)          # logits → predicted class index
+    acc = accuracy_score(p.label_ids, preds)  # 修正：原 File 6 未做 argmax，導致比較失效
     f1 = f1_score(p.label_ids, preds, average="macro")
     return {"accuracy": acc, "f1": f1}
 
@@ -540,9 +540,8 @@ if __name__ == "__main__":
         seed=SEED,
         data_seed=SEED,
         load_best_model_at_end=True,
-        metric_for_best_model="accuracy",
-        greater_is_better=True,
-        warmup_ratio=WARMUP_RATIO,
+        # metric_for_best_model 未設定 → 預設用 validation loss 選最佳模型，對齊 train.py (File 7)
+        # warmup_ratio 未設定 → 預設 0 warmup steps，對齊 train.py (File 7)
         report_to="none",
     )
 
