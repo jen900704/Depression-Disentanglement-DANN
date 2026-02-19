@@ -1,3 +1,15 @@
+"""
+新版 File 4 — DANN Scenario A (Screening / No Speaker Overlap)
+==============================================================
+目標：與 File 5 (run_dann.py) 完全一致的 DANN 訓練方法論
+唯一差異：資料路徑為 scenario_A_screening
+
+與 run_dann.py (File 5) 的差異清單：
+  → TRAIN_CSV_PATH: scenario_B_monitoring → scenario_A_screening
+  → TEST_CSV_PATH:  scenario_B_monitoring → scenario_A_screening
+  → t-SNE 存檔名：tsne_dann_run_{i}.png → tsne_dann_A_run_{i}.png
+"""
+
 import os
 import pandas as pd
 import numpy as np
@@ -15,21 +27,19 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # ==========================================
-# 🔧 1. 設定區 (Scenario A Config)
+# 🔧 1. 設定區 (Config) — 唯一差異：資料路徑
 # ==========================================
-# 🔥 改成 Scenario A 的路徑
 TRAIN_CSV_PATH = "./experiment_sisman_scientific/scenario_A_screening/train.csv"
 TEST_CSV_PATH = "./experiment_sisman_scientific/scenario_A_screening/test.csv"
-AUDIO_ROOT = "/export/fs05/hyeh10/depression/daic_5utt_full/merged_5"  # 填入您的正確路徑
+AUDIO_ROOT = "" 
 
 MODEL_NAME = "facebook/wav2vec2-base"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
 EPOCHS = 30  
-TOTAL_RUNS = 5 
+TOTAL_RUNS = 5  # 🔥 設定總共要跑幾次
 
 print(f"🖥️ 使用裝置: {DEVICE}")
-print(f"📂 執行 Scenario A (Strict Split) 實驗")
 
 # ==========================================
 # 🧠 2. 模型定義 (DANN Architecture)
@@ -67,7 +77,7 @@ class DANN_Model(nn.Module):
         self.domain_classifier = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, num_speakers) # 這裡的 num_speakers 是訓練集的總人數
+            nn.Linear(64, num_speakers)
         )
         self.grl = GradientReversalLayer()
 
@@ -96,29 +106,21 @@ def prepare_data(csv_path, processor, model, speaker_to_idx=None, is_train=True)
     
     label_map = {'dep': 1, '1': 1, 1: 1, 'non': 0, '0': 0, 0: 0}
 
-    # 建立或使用 Speaker Map
     if is_train and speaker_to_idx is None:
         all_speakers = df['path'].apply(extract_speaker_id).unique()
         all_speakers = sorted(all_speakers)
         speaker_to_idx = {spk: idx for idx, spk in enumerate(all_speakers)}
-        print(f"🔍 [訓練集] 共有 {len(all_speakers)} 位 Speaker。")
+        print(f"🔍 [訓練集] Speaker Map: {list(speaker_to_idx.items())[:5]}...")
     
     model.eval()
     with torch.no_grad():
         for _, row in tqdm(df.iterrows(), total=len(df), desc="Extracting Features"):
             wav_path = os.path.join(AUDIO_ROOT, row['path'])
             try:
-                # 簡單檢查檔案是否存在
-                if not os.path.exists(wav_path):
-                    continue
-
                 waveform, sample_rate = torchaudio.load(wav_path)
                 if sample_rate != 16000:
                     waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
-                # 平均多聲道
                 if waveform.shape[0] > 1: waveform = torch.mean(waveform, dim=0, keepdim=True)
-                # 長度截斷 (避免 OOM)
-                if waveform.shape[1] > 16000 * 8: waveform = waveform[:, :16000*8]
                 
                 raw_label = str(row['label']).strip().lower()
                 if raw_label in label_map:
@@ -128,21 +130,16 @@ def prepare_data(csv_path, processor, model, speaker_to_idx=None, is_train=True)
 
                 inputs = processor(waveform.squeeze().numpy(), sampling_rate=16000, return_tensors="pt", padding=True)
                 inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-                # 取 Wav2Vec2 的最後一層特徵並做 Mean Pooling
                 embeddings = model(**inputs).last_hidden_state.mean(dim=1).cpu()
                 
                 features_list.append(embeddings)
                 labels_list.append(final_label)
                 
                 spk_str = extract_speaker_id(wav_path)
-                # Scenario A 關鍵處理：如果是測試集且沒看過這個人，給 -1
-                if spk_str in speaker_to_idx:
-                    speaker_indices_list.append(speaker_to_idx[spk_str])
-                else:
-                    speaker_indices_list.append(-1) # Unknown speaker
+                speaker_indices_list.append(speaker_to_idx.get(spk_str, 0))
                 
             except Exception as e:
-                # print(f"⚠️ Error: {wav_path} -> {e}")
+                print(f"⚠️ Error: {wav_path} -> {e}")
                 continue
 
     if len(features_list) == 0:
@@ -153,6 +150,7 @@ def prepare_data(csv_path, processor, model, speaker_to_idx=None, is_train=True)
     s = torch.tensor(speaker_indices_list, dtype=torch.long)
     return X, y, s, speaker_to_idx
 
+# 輔助函式：用來從 DANN 模型抽取特徵畫圖
 def get_feats(model, loader):
     model.eval()
     feats = []
@@ -160,14 +158,13 @@ def get_feats(model, loader):
     with torch.no_grad():
         for inputs, labels, speakers in loader:
             inputs = inputs.to(DEVICE)
-            # 只取 shared_encoder 出來的特徵 (這就是 DANN 清洗後的特徵)
             f = model.shared_encoder(inputs).cpu().numpy()
             feats.append(f)
             spks.extend(speakers.cpu().numpy())
     return np.vstack(feats), np.array(spks)
 
 # ==========================================
-# 🚀 4. 主程式執行 (修正版：加入存檔與 F1)
+# 🚀 4. 主程式執行
 # ==========================================
 if __name__ == "__main__":
     # --- A. 準備特徵提取器 (凍結版) ---
@@ -175,40 +172,42 @@ if __name__ == "__main__":
     processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
     w2v_model = Wav2Vec2Model.from_pretrained(MODEL_NAME).to(DEVICE)
     
-    # --- B. 準備資料 ---
+    # --- B. 準備資料 (只做一次！) ---
     print("\n📦 正在準備資料 (特徵提取只會執行一次)...")
     X_train, y_train, s_train, speaker_map = prepare_data(TRAIN_CSV_PATH, processor, w2v_model, is_train=True)
     X_test, y_test, s_test, _ = prepare_data(TEST_CSV_PATH, processor, w2v_model, speaker_to_idx=speaker_map, is_train=False)
     
     num_speakers = len(speaker_map)
-    print(f"👥 訓練集 Speaker 數量: {num_speakers}")
     
+    # 建立 Dataset (Tensor 不會變，Loader 在迴圈內重建即可)
     train_dataset = TensorDataset(X_train, y_train, s_train)
     test_dataset = TensorDataset(X_test, y_test, s_test)
 
-    # --- C. 開始實驗迴圈 ---
+    # --- C. 開始 5 次實驗迴圈 ---
     for run_i in range(1, TOTAL_RUNS + 1):
         print(f"\n{'='*60}")
-        print(f"🎬 [Scenario A] 開始第 {run_i} / {TOTAL_RUNS} 次實驗")
+        print(f"🎬 開始第 {run_i} / {TOTAL_RUNS} 次實驗 (Run {run_i})")
         print(f"{'='*60}")
         
+        # 1. 每次都要重新建立 Loader (Shuffle 確保隨機性)
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True) # Test 也 Shuffle 讓畫圖隨機一點
         
-        print(f"🏗️ 初始化 DANN 模型...")
+        # 2. 每次都要重新初始化模型 (確保權重重置)
+        print(f"🏗️ 初始化全新的 DANN 模型...")
         dann_model = DANN_Model(num_speakers=num_speakers).to(DEVICE)
         
         optimizer = optim.Adam(dann_model.parameters(), lr=0.001)
         criterion_class = nn.CrossEntropyLoss()
         criterion_domain = nn.CrossEntropyLoss()
         
+        # 3. 訓練迴圈
         print("⚔️ 開始訓練...")
         for epoch in range(EPOCHS):
             dann_model.train()
             total_loss = 0
-            correct_train_spk = 0
-            total_train_samples = 0
             
+            # 動態調整 alpha
             p = float(epoch) / EPOCHS
             alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1
             
@@ -217,56 +216,49 @@ if __name__ == "__main__":
                 
                 optimizer.zero_grad()
                 class_out, domain_out = dann_model(inputs, alpha=alpha)
-                
-                loss_class = criterion_class(class_out, labels)
-                loss_domain = criterion_domain(domain_out, speakers)
-                loss = loss_class + loss_domain
+                loss = criterion_class(class_out, labels) + criterion_domain(domain_out, speakers)
                 loss.backward()
                 optimizer.step()
-                
                 total_loss += loss.item()
-                _, spk_preds = torch.max(domain_out, 1)
-                correct_train_spk += (spk_preds == speakers).sum().item()
-                total_train_samples += speakers.size(0)
             
-            train_spk_acc = correct_train_spk / total_train_samples
-
-            # --- 評估 (Validation) ---
-            if (epoch + 1) % 5 == 0 or epoch == EPOCHS - 1:
+            # 每個 Epoch 簡單評估一下
+            if (epoch + 1) % 10 == 0 or epoch == EPOCHS - 1:
                 dann_model.eval()
+                correct_speakers = 0
                 all_preds = []
                 all_labels = []
+                total_samples = 0
                 with torch.no_grad():
                     for inputs, labels, speakers in test_loader:
-                        inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-                        class_out, _ = dann_model(inputs, alpha=0)
+                        inputs, labels, speakers = inputs.to(DEVICE), labels.to(DEVICE), speakers.to(DEVICE)
+                        class_out, domain_out = dann_model(inputs, alpha=0)
+                        
                         _, preds = torch.max(class_out, 1)
                         all_preds.extend(preds.cpu().numpy())
                         all_labels.extend(labels.cpu().numpy())
+                        
+                        _, spk_preds = torch.max(domain_out, 1)
+                        correct_speakers += (spk_preds == speakers).sum().item()
+                        total_samples += labels.size(0)
                 
-                test_acc = accuracy_score(all_labels, all_preds)
-                # 🔥 這裡已經有 F1 了，很好！
-                test_f1 = f1_score(all_labels, all_preds, average='macro')
-                
-                print(f"Epoch {epoch+1:02d} | Loss: {total_loss:.2f} | Train Spk Acc: {train_spk_acc:.4f} (↓) | Test Dep Acc: {test_acc:.4f} (↑) | Test F1: {test_f1:.4f}")
+                acc = accuracy_score(all_labels, all_preds)
+                spk_acc = correct_speakers / total_samples
+                print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss:.2f} | Dep Acc: {acc:.4f} | Spk Acc: {spk_acc:.4f}")
 
-        # 4. 畫 t-SNE
-        print(f"\n🎨 [Run {run_i}] 繪製 t-SNE...")
-        train_feats_tsne, train_spks_tsne = get_feats(dann_model, train_loader)
-        tsne = TSNE(n_components=2, random_state=42 + run_i, perplexity=30)
-        feats_2d = tsne.fit_transform(train_feats_tsne)
+        # 4. 畫圖 (t-SNE) - 存成不同的檔名
+        print(f"\n🎨 [Run {run_i}] 正在繪製 t-SNE 圖...")
+        dann_feats, dann_spks = get_feats(dann_model, test_loader)
+        
+        tsne = TSNE(n_components=2, random_state=42 + run_i, perplexity=30) # Random state 隨 run 變動
+        feats_2d = tsne.fit_transform(dann_feats)
         
         plt.figure(figsize=(10, 8))
-        limit = 500
-        sns.scatterplot(x=feats_2d[:limit,0], y=feats_2d[:limit,1], hue=train_spks_tsne[:limit], palette="tab10", legend=False)
-        plt.title(f"DANN Feature Space (Training Set) - Run {run_i}\n(Goal: Mixed Colors = Privacy Preserved)", fontsize=16)
-        filename = f"tsne_dann_scenario_A_run_{run_i}.png"
+        limit = None
+        sns.scatterplot(x=feats_2d[:limit,0], y=feats_2d[:limit,1], hue=dann_spks[:limit], palette="tab10", legend=False)
+        plt.title(f"DANN Feature Space (Scenario A) - Run {run_i}", fontsize=16)
+        
+        # 🔥 關鍵：檔名每次都不同
+        filename = f"tsne_dann_A_run_{run_i}.png"
         plt.savefig(filename)
-        plt.close()
+        plt.close() # 關閉畫布釋放記憶體
         print(f"✅ 圖片已儲存: {filename}")
-
-        # 🔥🔥🔥 5. 關鍵新增：儲存模型！ 🔥🔥🔥
-        # 這樣 Probe 腳本才能讀取這個訓練好的模型
-        save_path = f"dann_model_run_{run_i}.pth"
-        torch.save(dann_model.state_dict(), save_path)
-        print(f"💾 模型已儲存至: {save_path} (可用於後續 Probe 測試)")
