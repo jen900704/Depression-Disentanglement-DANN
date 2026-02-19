@@ -100,10 +100,6 @@ class ScenarioADataset(Dataset):
         if sr != 16000:
             speech = torchaudio.transforms.Resample(sr, 16000)(speech)
         
-        # 🔥 微調更怕 OOM，長度限制要嚴格一點 (例如 8 秒)
-        MAX_LEN = 16000 * 8 
-        if speech.shape[1] > MAX_LEN:
-             speech = speech[:, :MAX_LEN]
 
         input_values = self.processor(speech.squeeze().numpy(), sampling_rate=16000, return_tensors="pt").input_values[0]
         
