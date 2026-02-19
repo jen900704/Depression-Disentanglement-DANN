@@ -115,7 +115,7 @@ class Wav2Vec2ForSpeechClassification(Wav2Vec2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.pooling_mode = config.pooling_mode
+        self.pooling_mode = getattr(config, "pooling_mode", "mean")
         self.config = config
 
         self.wav2vec2 = Wav2Vec2Model(config)
@@ -250,7 +250,7 @@ if version.parse(torch.__version__) >= version.parse("1.6"):
 class CTCTrainer(Trainer):
     """
     自訂 Trainer — 與 train.py (File 7) 的 CTCTrainer 完全一致
-    支援 AMP 混合精度訓練
+    支援 AMP 混合精度訓練 (已修復舊版 use_amp 與 autocast 報錯)
     """
     def training_step(
         self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]
@@ -258,22 +258,34 @@ class CTCTrainer(Trainer):
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        if self.use_amp:
-            with autocast():
+        # 🔥 修正 1：改用 self.args.fp16 或 bf16 來判斷是否啟用 AMP
+        is_amp_used = self.args.fp16 or self.args.bf16
+
+        # 計算 Loss
+        if is_amp_used:
+            # 🔥 修正 2：使用 PyTorch 2.x 新版標準的 autocast 語法
+            with torch.amp.autocast('cuda'):
                 loss = self.compute_loss(model, inputs)
         else:
             loss = self.compute_loss(model, inputs)
 
+        # 處理梯度累積 (Gradient Accumulation)
         if self.args.gradient_accumulation_steps > 1:
             loss = loss / self.args.gradient_accumulation_steps
 
-        if self.use_amp:
-            self.scaler.scale(loss).backward()
+        # 反向傳播 (Backward Pass)
+        if is_amp_used:
+            # 🔥 修正 3：更安全的 scaler/accelerator 呼叫方式 (相容新版 Hugging Face)
+            if hasattr(self, "scaler") and self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            elif hasattr(self, "accelerator"):
+                self.accelerator.backward(loss)
+            else:
+                loss.backward()
         else:
             loss.backward()
 
         return loss.detach()
-
 
 # ============================================================
 #  資料載入與預處理
