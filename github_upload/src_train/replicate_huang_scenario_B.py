@@ -92,11 +92,6 @@ class ScenarioBDataset(Dataset):
             speech, sr = torchaudio.load(wav_path)
             if sr != 16000:
                 speech = torchaudio.transforms.Resample(sr, 16000)(speech)
-            
-            # 🔥 保持跟 Scenario A 一樣的長度限制 (8秒)
-            MAX_LEN = 16000 * 8 
-            if speech.shape[1] > MAX_LEN:
-                 speech = speech[:, :MAX_LEN]
     
             input_values = self.processor(speech.squeeze().numpy(), sampling_rate=16000, return_tensors="pt").input_values[0]
             
