@@ -157,12 +157,23 @@ def load_huang_embeddings(csv_path, processor, model_dir):
     載入微調後的 best_model，抽 768 維 mean pooling 特徵。
     回傳：X (N, 768), speaker_ids (N,)
     """
+    from safetensors.torch import load_file
+    
     config = AutoConfig.from_pretrained(model_dir)
     model  = Wav2Vec2ForSpeechClassification(config).to(DEVICE)
-    state_dict_path = os.path.join(model_dir, "pytorch_model.bin")
-    model.load_state_dict(
-        torch.load(state_dict_path, map_location=DEVICE), strict=False
-    )
+    
+    # 優先找 safetensors
+    safetensors_path = os.path.join(model_dir, "model.safetensors")
+    bin_path = os.path.join(model_dir, "pytorch_model.bin")
+    
+    if os.path.exists(safetensors_path):
+        state_dict = load_file(safetensors_path)
+    elif os.path.exists(bin_path):
+        state_dict = torch.load(bin_path, map_location=DEVICE, weights_only=True)
+    else:
+        raise FileNotFoundError(f"找不到模型權重檔，檢查 {model_dir}")
+        
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
 
     df = pd.read_csv(csv_path)
