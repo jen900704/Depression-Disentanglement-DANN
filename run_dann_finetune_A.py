@@ -384,6 +384,7 @@ def preprocess_function(batch, processor):
     )
     batch["input_values"] = result.input_values[0]
     batch["labels"]       = batch["label"]
+    batch["speaker_label"] = batch["speaker_label"]
     return batch
 
 # ============================================================
