@@ -231,7 +231,7 @@ if __name__ == "__main__":
                 
                 acc = accuracy_score(all_labels, all_preds)
                 spk_acc = correct_speakers / total_samples
-                print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss:.2f} | Dep Acc: {acc:.4f} | Spk Acc: {spk_acc:.4f}")
+                print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss:.2f} | Dep Acc: {acc:.4f} | Dep F1: {f1:.4f} | Spk Acc: {spk_acc:.4f}")
 
         # 4. 畫圖 (t-SNE) - 存成不同的檔名
         print(f"\n🎨 [Run {run_i}] 正在繪製 t-SNE 圖...")
