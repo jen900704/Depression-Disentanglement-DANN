@@ -384,6 +384,7 @@ def preprocess_function(batch, processor):
     )
     batch["input_values"] = result.input_values[0]
     batch["labels"]       = batch["label"]
+    batch["speaker_label"] = batch["speaker_label"]
     return batch
 
 # ============================================================
@@ -587,3 +588,4 @@ if __name__ == "__main__":
     results_df.to_csv(summary_path, index=False)
     print(f"\n✅ 彙總結果已儲存至 {summary_path}")
     print("\n🏁 DANN + Finetune Transformer Scenario B 完成！")
+
