@@ -11,9 +11,10 @@ from sklearn.metrics import accuracy_score, f1_score, classification_report
 # ==========================================
 # 1. 設定區 (Config) - 對齊 Scenario A
 # ==========================================
-TRAIN_CSV = "./experiment_sisman_scientific/scenario_B_monitoring/train.csv"
-TEST_CSV  = "./experiment_sisman_scientific/scenario_B_monitoring/test.csv"
-AUDIO_ROOT = "/export/fs05/hyeh10/depression/daic_5utt_full/merged_5" 
+
+TRAIN_CSV_PATH = "./experiment_sisman_scientific/scenario_B_monitoring/train.csv"
+TEST_CSV_PATH = "./experiment_sisman_scientific/scenario_B_monitoring/test.csv"
+AUDIO_ROOT = "/export/fs05/hyeh10/depression/daic_5utt_full/merged_5"
 
 MODEL_NAME = "facebook/wav2vec2-base"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -109,7 +110,7 @@ if __name__ == "__main__":
     # 5. 輸出五次平均與標準差
     # ==========================================
     print(f"\n{'='*50}")
-    print(f"🏆 Scenario A: Linear Probing ({TOTAL_RUNS} runs) 最終結果")
+    print(f"🏆 Scenario B: Linear Probing ({TOTAL_RUNS} runs) 最終結果")
     print(f"{'='*50}")
     
     accs_np = np.array(all_accs)
