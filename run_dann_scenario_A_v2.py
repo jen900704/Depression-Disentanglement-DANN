@@ -272,6 +272,11 @@ if __name__ == "__main__":
         plt.close()
         print(f"✅ 圖片已儲存: {filename}")
 
+        # 5. 存下 shared_encoder 權重，供後續 speaker probe 使用
+        save_path = f"dann_A_shared_encoder_run_{run_i}.pth"
+        torch.save(dann_model.shared_encoder.state_dict(), save_path)
+        print(f"💾 Shared Encoder 已儲存: {save_path}")
+
     # --- E. 5 次實驗總結 ---
     print(f"\n{'='*60}")
     print(f"📊 {TOTAL_RUNS} 次實驗結果統計 (Scenario A)")
