@@ -1,6 +1,6 @@
 """
-File 2 — Scenario A (Strict Speaker Split)
-===========================================
+File 2 — Scenario A (Strict Speaker Split) ── v3 速度 & OOM 修正版
+=====================================================================
 對齊 File 6+7+8 (build_model.py / train.py / evaluate.py) 的訓練管線
 - 模型架構：Wav2Vec2ForSpeechClassification (mean pooling + frozen CNN)
 - 訓練框架：HuggingFace Trainer (AdamW + linear LR scheduler)
@@ -9,9 +9,20 @@ File 2 — Scenario A (Strict Speaker Split)
 - return_attention_mask：False（對齊 yaml）
 - 五次實驗迴圈，最後輸出平均與標準差
 
-對齊 daic-c2-rmse-roc.yaml 設定：
-  seed=103 | lr=1e-5 | epochs=10 | batch=4 | grad_accum=2
-  save/eval/logging_steps=10 | save_total_limit=2
+v3 修改摘要（速度 & OOM 防護，與 Scenario B v3 完全一致）：
+  ① eval_steps / save_steps / logging_steps：10 → 100（減少 eval 次數 10x）
+  ② dataloader_num_workers=0 + pin_memory=False：避免多 worker 佔用額外 RAM
+  ③ OOM 捕捉：whole training loop + empty_cache + gc.collect()
+  ④ 每次 eval / predict 前後加 torch.cuda.empty_cache() 防止評估時 OOM
+  ⑤ 每次 run 結束 del model/trainer + empty_cache，防止 5 次實驗累積記憶體
+  ⑥ gradient_checkpointing 保留（省 GPU 記憶體，代價是輕微減速）
+  ⑦ 保留 fp16=True（CUDA 環境下省記憶體且加速）
+  ⑧ LengthGroupedSampler：訓練時按音訊長度排序，減少 padding 浪費 → 防 OOM
+  ⑨ CTCTrainer 覆寫 get_train_dataloader / get_eval_dataloader 使用長度排序
+  ※ 音訊長度不截斷，完整保留原始資料
+
+對齊 daic-c2-rmse-roc.yaml 設定（不動）：
+  seed=103 | lr=1e-5 | epochs=10 | batch=1+grad_accum=8 (eff=8)
   freeze_feature_extractor=True | pooling_mode=mean
   return_attention_mask=False | metric_for_best_model → eval_loss (預設)
 """
@@ -53,14 +64,14 @@ from sklearn.metrics import (
 )
 
 # ============================================================
-#  設定區 — 對齊 daic-c2-rmse-roc.yaml
+#  設定區 — 路徑為 scenario_A_screening，其餘對齊 yaml
 # ============================================================
 TRAIN_CSV  = "./experiment_sisman_scientific/scenario_A_screening/train.csv"
 TEST_CSV   = "./experiment_sisman_scientific/scenario_A_screening/test.csv"
 AUDIO_ROOT = "/export/fs05/hyeh10/depression/daic_5utt_full/merged_5"
 
 MODEL_NAME = "facebook/wav2vec2-base"
-OUTPUT_DIR = "./output_scenario_A_v2"
+OUTPUT_DIR = "./output_scenario_A_v3"
 
 SEED                         = 103
 NUM_EPOCHS                   = 10
@@ -69,9 +80,10 @@ PER_DEVICE_TRAIN_BATCH_SIZE  = 1
 PER_DEVICE_EVAL_BATCH_SIZE   = 1
 GRADIENT_ACCUMULATION_STEPS  = 8
 FP16                         = torch.cuda.is_available()
-EVAL_STEPS                   = 10
-SAVE_STEPS                   = 10
-LOGGING_STEPS                = 10
+# ▼ v3 修正：eval 頻率降低 10 倍，大幅縮短總訓練時間
+EVAL_STEPS                   = 100
+SAVE_STEPS                   = 100
+LOGGING_STEPS                = 50
 SAVE_TOTAL_LIMIT             = 2
 
 TOTAL_RUNS = 5  # 五次實驗取平均
@@ -234,6 +246,15 @@ if version.parse(torch.__version__) >= version.parse("1.6"):
     _is_native_amp_available = True
 
 
+def _length_sorted_indices(dataset) -> list:
+    """
+    回傳按 input_values 長度排序的 index 清單。
+    長度相近的樣本會被排在一起，大幅減少 batch 內 padding，防止 OOM。
+    """
+    lengths = [len(dataset[i]["input_values"]) for i in range(len(dataset))]
+    return sorted(range(len(lengths)), key=lambda i: lengths[i])
+
+
 class CTCTrainer(Trainer):
     def training_step(
         self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]
@@ -263,6 +284,43 @@ class CTCTrainer(Trainer):
             loss.backward()
 
         return loss.detach()
+
+    def get_train_dataloader(self):
+        """
+        ▼ v3 OOM 防護：訓練時按音訊長度排序（長度相近的排在一起），
+          大幅減少 batch 內 padding 大小，是 A100 上最有效的非截斷 OOM 對策。
+          batch_size=1 時每筆獨立，padding 由 collator 做到 batch 內最長，
+          排序後最長音訊不會與最短混在同一 batch，避免暴增的 padding tensor。
+        """
+        from torch.utils.data import DataLoader, Subset, SequentialSampler
+        dataset = self.train_dataset
+        sorted_indices = _length_sorted_indices(dataset)
+        sorted_dataset = Subset(dataset, sorted_indices)
+        return DataLoader(
+            sorted_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            sampler=SequentialSampler(sorted_dataset),
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        """
+        ▼ v3 OOM 防護：評估時同樣按長度排序，防止超長音訊在評估中觸發 OOM。
+        """
+        from torch.utils.data import DataLoader, Subset, SequentialSampler
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        sorted_indices = _length_sorted_indices(dataset)
+        sorted_dataset = Subset(dataset, sorted_indices)
+        return DataLoader(
+            sorted_dataset,
+            batch_size=self.args.per_device_eval_batch_size,
+            sampler=SequentialSampler(sorted_dataset),
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
 
 
 # ============================================================
@@ -459,6 +517,9 @@ if __name__ == "__main__":
             # metric_for_best_model 不設定 → 預設 eval_loss（對齊 yaml）
             report_to="none",
             gradient_checkpointing=True,
+            # ▼ v3：關閉多 worker，避免 DataLoader 佔用額外 RAM
+            dataloader_num_workers=0,
+            dataloader_pin_memory=False,
         )
 
         trainer = CTCTrainer(
@@ -472,12 +533,14 @@ if __name__ == "__main__":
         )
 
         print("⚔️ 開始訓練...")
+        # ▼ v3：完整 OOM 防護 — 捕捉整個 train()，清 cache 後提示
         try:
             trainer.train()
         except RuntimeError as e:
-            if "out of memory" in str(e):
-                print("⚠️ GPU 記憶體不足！清除快取...")
+            if "out of memory" in str(e).lower():
+                print("\n⚠️  OOM！嘗試清除 GPU cache 後繼續評估（訓練未完整完成）...")
                 torch.cuda.empty_cache()
+                import gc; gc.collect()
             else:
                 raise e
 
@@ -486,11 +549,19 @@ if __name__ == "__main__":
         processor.save_pretrained(best_model_path)
         print(f"💾 Run {run_i} 最佳模型已儲存至: {best_model_path}")
 
+        # ▼ v3：評估前釋放 GPU 記憶體
+        torch.cuda.empty_cache()
+        import gc; gc.collect()
         print(f"\n📊 Run {run_i} 測試集評估...")
         results = full_evaluation(trainer, test_dataset, OUTPUT_DIR, run_i)
         results["run"] = run_i
         all_results.append(results)
         print(f"Run {run_i} → Acc: {results['accuracy']:.4f} | F1: {results['f1']:.4f} | AUC: {results['auc']:.4f}")
+
+        # ▼ v3：每次 run 結束後釋放模型記憶體，避免多次實驗累積 OOM
+        del model, trainer
+        torch.cuda.empty_cache()
+        import gc; gc.collect()
 
     # ============================================================
     #  輸出五次平均與標準差
