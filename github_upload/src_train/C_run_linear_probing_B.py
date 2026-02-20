@@ -1,78 +1,96 @@
 import os
-import yaml
-import torch
+import pandas as pd
 import numpy as np
-from datasets import load_from_disk
-from transformers import Wav2Vec2Model
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+import torch
+import torchaudio
 from tqdm import tqdm
+from transformers import Wav2Vec2Processor, Wav2Vec2Model
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score, classification_report
 
-def run_linear_probing(config_path):
-    with open(config_path) as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
+# ==========================================
+# 1. 設定區 (Config) - 對齊 Scenario A
+# ==========================================
+TRAIN_CSV = "./experiment_sisman_scientific/scenario_B_monitoring/train.csv"
+TEST_CSV  = "./experiment_sisman_scientific/scenario_B_monitoring/test.csv"
+AUDIO_ROOT = "/export/fs05/hyeh10/depression/daic_5utt_full/merged_5" 
 
-    features_path = os.path.join(config['output_dir'], 'features')
-    train_dir = os.path.join(features_path, "train_dataset")
-    eval_dir = os.path.join(features_path, "eval_dataset")
+MODEL_NAME = "facebook/wav2vec2-base"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TOTAL_RUNS = 5
 
-    try:
-        train_dataset = load_from_disk(train_dir)
-        eval_dataset = load_from_disk(eval_dir)
-    except Exception as e:
-        print(f"❌ 讀取資料集失敗: {e}")
-        return
+print(f"🖥️ 運算設備: {DEVICE}")
 
-    # 1. 喚醒 Wav2Vec2 模型來當「特徵抽取器」
-    print("🧠 正在載入 Wav2Vec2 模型提取深層特徵 (Embeddings)...")
+# ==========================================
+# 2. 資料處理工具 (直接從音檔抽取，確保與 DANN A 對齊)
+# ==========================================
+def prepare_data_for_probing(csv_path, processor, model):
+    df = pd.read_csv(csv_path)
+    print(f"📂 正在處理 {csv_path} (共 {len(df)} 筆)...")
     
-    # 自動偵測是否有 GPU 可以加速
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🖥️ 運算設備: {device}")
+    features_list = []
+    labels_list = []
+    label_map = {'dep': 1, '1': 1, 1: 1, 'non': 0, '0': 0, 0: 0}
     
-    model_name = config.get('processor_name_or_path', 'facebook/wav2vec2-base')
-    model = Wav2Vec2Model.from_pretrained(model_name).to(device)
-    model.eval() # 鎖定模型，不更新權重
+    model.eval()
+    with torch.no_grad():
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Extracting Features"):
+            wav_path = os.path.join(AUDIO_ROOT, row['path'])
+            try:
+                waveform, sample_rate = torchaudio.load(wav_path)
+                if sample_rate != 16000:
+                    waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
+                if waveform.shape[0] > 1: 
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+                
+                raw_label = str(row['label']).strip().lower()
+                if raw_label not in label_map: continue
+                final_label = label_map[raw_label]
 
-    # 2. 定義抽取函數
-    def get_embeddings(dataset):
-        embeddings = []
-        labels = []
-        for item in tqdm(dataset, desc="抽取特徵中"):
-            # 取出原始波形，轉成 tensor 並丟到 GPU/CPU
-            input_values = torch.tensor(item['input_values']).unsqueeze(0).to(device)
-            if input_values.shape[1] == 0: continue
-            
-            with torch.no_grad(): # 省記憶體大法
-                outputs = model(input_values)
-                # 取出最後一層的特徵，並對時間軸做平均 (Global Average Pooling) -> 變成 768 維
-                hidden_state = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
-            
-            embeddings.append(hidden_state)
-            labels.append(item['labels'])
-        return np.array(embeddings), np.array(labels)
+                # 提取 Wav2Vec2 凍結特徵
+                inputs = processor(waveform.squeeze().numpy(), sampling_rate=16000, return_tensors="pt", padding=True)
+                inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+                embeddings = model(**inputs).last_hidden_state.mean(dim=1).cpu()
+                
+                features_list.append(embeddings)
+                labels_list.append(final_label)
+                
+            except Exception as e:
+                print(f"⚠️ Error: {wav_path} -> {e}")
+                continue
 
-    # 3. 開始抽取
-    print("\n⏳ 轉換【訓練集】 (這需要一點時間)...")
-    X_train, y_train = get_embeddings(train_dataset)
-    print("\n⏳ 轉換【測試集】...")
-    X_test, y_test = get_embeddings(eval_dataset)
+    X = torch.cat(features_list, dim=0).numpy()
+    y = np.array(labels_list)
+    return X, y
 
-    print(f"\n✅ 成功獲得深層特徵！進入 Linear Probing 模型形狀: X_train={X_train.shape}")
-    
-    # 4. 真正公平的對決：Logistic Regression (執行 5 次)
-    TOTAL_RUNS = 5
+# ==========================================
+# 3. 主程式執行
+# ==========================================
+if __name__ == "__main__":
+    print("🧠 載入 Wav2Vec2 模型提取深層特徵...")
+    processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+    w2v_model = Wav2Vec2Model.from_pretrained(MODEL_NAME).to(DEVICE)
+    w2v_model.eval() # 嚴格凍結 Backbone，不更新權重
+
+    print("\n⏳ 抽取【訓練集】特徵...")
+    X_train, y_train = prepare_data_for_probing(TRAIN_CSV_PATH, processor, w2v_model)
+    print("\n⏳ 抽取【測試集】特徵...")
+    X_test, y_test = prepare_data_for_probing(TEST_CSV_PATH, processor, w2v_model)
+
+    print(f"\n✅ 特徵抽取完畢！形狀: X_train={X_train.shape}, X_test={X_test.shape}")
+
     all_accs = []
     all_f1s = []
 
     print(f"\n🚀 開始執行 Linear Probing ({TOTAL_RUNS} 次實驗)...")
     
+    # 4. 執行 5 次迴圈
     for run_i in range(1, TOTAL_RUNS + 1):
         print(f"\n{'-'*30}")
         print(f"🎬 Run {run_i} / {TOTAL_RUNS}")
         print(f"{'-'*30}")
         
-        # 每次更換 random_state 確保初始狀態與演算法隨機性不同
+        # 設定 Random State 確保每次訓練的隨機性不同
         current_seed = 42 + run_i
         
         clf = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=current_seed)
@@ -80,24 +98,18 @@ def run_linear_probing(config_path):
         y_pred = clf.predict(X_test)
         
         acc = accuracy_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred, average='macro') # 使用 macro F1 對齊你的其他實驗
+        f1 = f1_score(y_test, y_pred, average='macro')
         
         all_accs.append(acc)
         all_f1s.append(f1)
         
         print(f"Run {run_i} -> Acc: {acc:.4f} | F1: {f1:.4f}")
 
-        # 如果你想看第一次的詳細報告，可以解除這裡的註解
-        # if run_i == 1:
-        #     print("\n📊 第一次實驗的詳細報告:")
-        #     print(classification_report(y_test, y_pred, zero_division=0))
-        #     print("混淆矩陣:\n", confusion_matrix(y_test, y_pred))
-
     # ==========================================
     # 5. 輸出五次平均與標準差
     # ==========================================
     print(f"\n{'='*50}")
-    print(f"🏆 Linear Probing ({TOTAL_RUNS} runs) 最終結果統計")
+    print(f"🏆 Scenario A: Linear Probing ({TOTAL_RUNS} runs) 最終結果")
     print(f"{'='*50}")
     
     accs_np = np.array(all_accs)
@@ -105,7 +117,3 @@ def run_linear_probing(config_path):
     
     print(f"🎯 平均 憂鬱症 Acc (Dep Acc): {accs_np.mean():.4f} ± {accs_np.std():.4f}")
     print(f"🎯 平均 憂鬱症 F1  (Dep F1) : {f1s_np.mean():.4f} ± {f1s_np.std():.4f}")
-
-if __name__ == '__main__':
-    
-    run_linear_probing("daic-c2-rmse-roc.yaml")
