@@ -108,12 +108,12 @@ class GradientReversalLayer(nn.Module):
 # ============================================================
 @dataclass
 class DANNOutput(ModelOutput):
-    loss:         Optional[torch.FloatTensor] = None
-    loss_dep:     Optional[torch.FloatTensor] = None
-    loss_spk:     Optional[torch.FloatTensor] = None
-    logits:       torch.FloatTensor           = None
+    loss:          Optional[torch.FloatTensor] = None
+    loss_dep:      Optional[torch.FloatTensor] = None
+    loss_spk:      Optional[torch.FloatTensor] = None
+    logits:        torch.FloatTensor           = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions:   Optional[Tuple[torch.FloatTensor]]  = None
+    attentions:    Optional[Tuple[torch.FloatTensor]] = None
 
 # ============================================================
 #  模型定義
@@ -266,7 +266,16 @@ class DataCollatorDANN:
 #  compute_metrics（憂鬱症分類，對齊 Huang）
 # ============================================================
 def compute_metrics(p: EvalPrediction):
-    preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+    # p.predictions 可能會把 loss_dep, loss_spk, logits 通通裝在 tuple 裡
+    if isinstance(p.predictions, tuple):
+        # 我們只找維度是 2 的那個陣列（也就是 logits，形狀為 [batch_size, 2]）
+        for pred_array in p.predictions:
+            if isinstance(pred_array, np.ndarray) and pred_array.ndim == 2:
+                preds = pred_array
+                break
+    else:
+        preds = p.predictions
+
     preds = np.argmax(preds, axis=1)
     return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
 
@@ -393,8 +402,15 @@ def preprocess_function(batch, processor):
 def full_evaluation(trainer, test_dataset, output_dir, run_i):
     predictions = trainer.predict(test_dataset)
     preds = predictions.predictions
+    
+    # --- 加入防呆邏輯 ---
     if isinstance(preds, tuple):
-        preds = preds[0]
+        for pred_array in preds:
+            if isinstance(pred_array, np.ndarray) and pred_array.ndim == 2:
+                preds = pred_array
+                break
+    # ------------------
+    
     y_pred = np.argmax(preds, axis=1)
     y_true = predictions.label_ids
 
@@ -486,10 +502,10 @@ if __name__ == "__main__":
         config = Wav2Vec2Config.from_pretrained(
             MODEL_NAME,
             num_labels=2,
-            num_speakers=num_speakers,
             final_dropout=0.1,
             pooling_mode="mean",
         )
+        config.num_speakers = num_speakers  # <--- 🔴 強制寫入 config，不讓它被忽略！
         model = Wav2Vec2DANNFinetune.from_pretrained(MODEL_NAME, config=config)
         model.freeze_feature_extractor()   # 只凍結 CNN
         print(f"❄️ CNN 已凍結，Transformer 可訓練")
@@ -515,6 +531,7 @@ if __name__ == "__main__":
             learning_rate=LEARNING_RATE,
             save_total_limit=SAVE_TOTAL_LIMIT,
             seed=run_seed,
+            remove_unused_columns=False,
             data_seed=run_seed,
             load_best_model_at_end=True,
             report_to="none",
