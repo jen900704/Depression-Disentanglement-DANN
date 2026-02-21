@@ -91,7 +91,7 @@ if __name__ == "__main__":
         print(f"{'-'*30}")
         
         # 設定 Random State 確保每次訓練的隨機性不同
-        current_seed = 42 + run_i
+        current_seed = 102 + run_i  # 對齊其他模型 seed: 103, 104, 105, 106, 107
         
         clf = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=current_seed)
         clf.fit(X_train, y_train)
