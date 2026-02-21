@@ -1,5 +1,5 @@
 """
-DANN with Fine-tuned Transformer — Scenario A (Screening / No Speaker Overlap)
+DANN with Fine-tuned Transformer — Scenario B (Longitudinal / Speaker Overlap)
 ===============================================================================
 架構說明：
   - Wav2Vec2 CNN：凍結（同 Huang）
@@ -10,7 +10,7 @@ DANN with Fine-tuned Transformer — Scenario A (Screening / No Speaker Overlap)
   - Speaker Classifier：GRL + FC(128→64), ReLU, FC(64→N_spk)
   - Total Loss = L_dep + L_spk
 
-與舊 DANN (run_dann_scenario_A_v2.py) 的差異：
+與舊 DANN (run_dann_scenario_B_v2.py) 的差異：
   → Wav2Vec2 Transformer 開放微調（舊版完全凍結）
   → 使用 HuggingFace Trainer 框架（對齊 Huang 的訓練方式）
   → lr=1e-5, batch=4, grad_accum=2, epochs=10（對齊 Huang yaml）
@@ -108,12 +108,12 @@ class GradientReversalLayer(nn.Module):
 # ============================================================
 @dataclass
 class DANNOutput(ModelOutput):
-    loss:         Optional[torch.FloatTensor] = None
-    loss_dep:     Optional[torch.FloatTensor] = None
-    loss_spk:     Optional[torch.FloatTensor] = None
-    logits:       torch.FloatTensor           = None
+    loss:          Optional[torch.FloatTensor] = None
+    loss_dep:      Optional[torch.FloatTensor] = None
+    loss_spk:      Optional[torch.FloatTensor] = None
+    logits:        torch.FloatTensor           = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions:   Optional[Tuple[torch.FloatTensor]]  = None
+    attentions:    Optional[Tuple[torch.FloatTensor]] = None
 
 # ============================================================
 #  模型定義
@@ -133,7 +133,7 @@ class Wav2Vec2DANNFinetune(Wav2Vec2PreTrainedModel):
         num_speakers       = getattr(config, "num_speakers", 38)
         self.pooling_mode  = getattr(config, "pooling_mode", "mean")
 
-        # Shared Encoder：768 → 128（同舊 DANN）
+        # Shared Encoder：768 → 128
         self.shared_encoder = nn.Sequential(
             nn.Linear(hidden, 128),
             nn.BatchNorm1d(128),
@@ -159,7 +159,7 @@ class Wav2Vec2DANNFinetune(Wav2Vec2PreTrainedModel):
         self.init_weights()
 
     def freeze_feature_extractor(self):
-        """只凍結 CNN，Transformer 保持可訓練（同 Huang）"""
+        """只凍結 CNN，Transformer 保持可訓練"""
         self.wav2vec2.feature_extractor._freeze_parameters()
 
     def merged_strategy(self, hidden_states):
@@ -263,10 +263,19 @@ class DataCollatorDANN:
         return batch
 
 # ============================================================
-#  compute_metrics（憂鬱症分類，對齊 Huang）
+#  compute_metrics（憂鬱症分類，加入 Tuple 防呆）
 # ============================================================
 def compute_metrics(p: EvalPrediction):
-    preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+    # p.predictions 可能會把 loss_dep, loss_spk, logits 通通裝在 tuple 裡
+    if isinstance(p.predictions, tuple):
+        # 我們只找維度是 2 的那個陣列（也就是 logits，形狀為 [batch_size, 2]）
+        for pred_array in p.predictions:
+            if isinstance(pred_array, np.ndarray) and pred_array.ndim == 2:
+                preds = pred_array
+                break
+    else:
+        preds = p.predictions
+
     preds = np.argmax(preds, axis=1)
     return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
 
@@ -288,7 +297,7 @@ class DANNTrainer(Trainer):
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        # 動態 alpha（同舊 DANN，從 0 漸增到 1）
+        # 動態 alpha（從 0 漸增到 1）
         p     = self.current_step / max(self.total_steps, 1)
         alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1
         self.current_step += 1
@@ -388,13 +397,20 @@ def preprocess_function(batch, processor):
     return batch
 
 # ============================================================
-#  評估
+#  評估 (加入 Tuple 防呆)
 # ============================================================
 def full_evaluation(trainer, test_dataset, output_dir, run_i):
     predictions = trainer.predict(test_dataset)
     preds = predictions.predictions
+    
+    # --- 加入防呆邏輯 ---
     if isinstance(preds, tuple):
-        preds = preds[0]
+        for pred_array in preds:
+            if isinstance(pred_array, np.ndarray) and pred_array.ndim == 2:
+                preds = pred_array
+                break
+    # ------------------
+    
     y_pred = np.argmax(preds, axis=1)
     y_true = predictions.label_ids
 
@@ -442,7 +458,7 @@ def full_evaluation(trainer, test_dataset, output_dir, run_i):
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 DANN + Fine-tuned Transformer — Scenario A")
+    print("🚀 DANN + Fine-tuned Transformer — Scenario B")
     print("   CNN: Frozen | Transformer: Trainable | GRL: On")
     print(f"   實驗次數: {TOTAL_RUNS} 次")
     print("=" * 60)
@@ -486,10 +502,10 @@ if __name__ == "__main__":
         config = Wav2Vec2Config.from_pretrained(
             MODEL_NAME,
             num_labels=2,
-            num_speakers=num_speakers,
             final_dropout=0.1,
             pooling_mode="mean",
         )
+        config.num_speakers = num_speakers  # <--- 🔴 強制寫入 config，不讓它被忽略！
         model = Wav2Vec2DANNFinetune.from_pretrained(MODEL_NAME, config=config)
         model.freeze_feature_extractor()   # 只凍結 CNN
         print(f"❄️ CNN 已凍結，Transformer 可訓練")
@@ -515,6 +531,7 @@ if __name__ == "__main__":
             learning_rate=LEARNING_RATE,
             save_total_limit=SAVE_TOTAL_LIMIT,
             seed=run_seed,
+            remove_unused_columns=False,
             data_seed=run_seed,
             load_best_model_at_end=True,
             report_to="none",
