@@ -535,6 +535,8 @@ if __name__ == "__main__":
             data_seed=run_seed,
             load_best_model_at_end=True,
             report_to="none",
+            # 💡 [關鍵修復]：丟棄最後一個未滿 batch_size 的 batch，防止 BatchNorm 崩潰！
+            dataloader_drop_last=True,
         )
 
         trainer = DANNTrainer(
@@ -605,4 +607,3 @@ if __name__ == "__main__":
     results_df.to_csv(summary_path, index=False)
     print(f"\n✅ 彙總結果已儲存至 {summary_path}")
     print("\n🏁 DANN + Finetune Transformer Scenario B 完成！")
-
