@@ -1,29 +1,39 @@
 """
-DANN with Fine-tuned Transformer — Scenario A (Screening / No Speaker Overlap)
+DANN + Fine-tuned Transformer — Scenario A (Screening / No Speaker Overlap)
 ===============================================================================
-架構說明：
-  - Wav2Vec2 CNN：凍結（同 Huang）
-  - Wav2Vec2 Transformer：可訓練（同 Huang）
-  - Mean Pooling → 768 維
-  - Shared Encoder：FC(768→128), BN, ReLU, Dropout(0.3)（同舊 DANN）
-  - Depression Classifier：FC(128→64), ReLU, FC(64→2)
-  - Speaker Classifier：GRL + FC(128→64), ReLU, FC(64→N_spk)
-  - Total Loss = L_dep + L_spk
+修正版 v3：修正 Speaker Map 邏輯 + 對齊 Huang A 以便公平比較
 
-與舊 DANN (run_dann_scenario_A_v2.py) 的差異：
-  → Wav2Vec2 Transformer 開放微調（舊版完全凍結）
-  → 使用 HuggingFace Trainer 框架（對齊 Huang 的訓練方式）
-  → lr=1e-5, batch=4, grad_accum=2, epochs=10（對齊 Huang yaml）
-  → 說話者對抗 loss 在 training_step 內計算
+Scenario A 的 Speaker 邏輯說明：
+  - Train set：全是路人（Base 4,403 + Filler 714，共 ~151 位）
+  - Test set：38 位 Target Group（train 從未見過）
+  - GRL 目標：對 train 的路人做 adversarial，讓模型不依賴任何聲紋
+              希望泛化到 test 的陌生人
+  - Test 的 speaker_label = -1（不參與 L_spk，對應論文 Table 1 Spk Acc = N/A）
 
-與 Huang (replicate_huang_partial_finetuning.py) 的差異：
-  → 多了 Shared Encoder（768→128）
-  → 多了 Speaker Classifier + GRL
-  → Total Loss = L_dep + L_spk（舊版只有 L_dep）
+修正項目：
+  [v3-1] speaker_map.get(spk_id, 0) → speaker_map.get(spk_id, -1)
+         test 的 38 位陌生人不在 map 內，給 -1 而非 0（0 是某位路人的 index）
+  [v3-2] forward 裡加 mask，只對 speaker_labels >= 0 計算 L_spk
+         → train 路人正常參與；test 陌生人不計入 loss
+  [v3-3] compute_metrics 加入 f1，對齊 Huang A
+  [v3-4] metric_for_best_model="f1"，對齊 Huang A
+
+對齊 Huang A 的比較基準（不可改動項目）：
+  ✅ 相同資料：scenario_A_screening train/test（5117/714筆）
+  ✅ 相同 backbone：facebook/wav2vec2-base
+  ✅ 相同 CNN 凍結：freeze_feature_extractor()
+  ✅ 相同 lr=1e-5、batch=4、grad_accum=2、epochs=10
+  ✅ 相同 eval/save/logging_steps=10、save_total_limit=2
+  ✅ 相同 5次實驗迴圈，輸出平均±標準差
+  ✅ 相同 checkpoint 選取：load_best_model_at_end=True, metric_for_best_model="f1"
+  ✅ 相同 eval_dataset=test_dataset（無獨立 valid set）
+
+與 Huang A 的唯一架構差異（刻意保留）：
+  ❗ Shared Encoder (768→128) + Depression Classifier + Speaker Classifier + GRL
+  ❗ Loss = L_dep + L_spk（adversarial 對抗 train 路人的 speaker identity）
 """
 
 import os
-import random
 import numpy as np
 import pandas as pd
 import torch
@@ -61,14 +71,14 @@ from sklearn.metrics import (
 )
 
 # ============================================================
-#  設定區
+#  設定區 — 對齊 Huang A
 # ============================================================
 TRAIN_CSV  = "./experiment_sisman_scientific/scenario_A_screening/train.csv"
 TEST_CSV   = "./experiment_sisman_scientific/scenario_A_screening/test.csv"
 AUDIO_ROOT = ""   # CSV 內已是絕對路徑
 
 MODEL_NAME = "facebook/wav2vec2-base"
-OUTPUT_DIR = "./output_dann_finetune_A"
+OUTPUT_DIR = "./output_dann_finetune_A_v3"
 
 SEED                        = 103
 NUM_EPOCHS                  = 10
@@ -77,9 +87,9 @@ PER_DEVICE_TRAIN_BATCH_SIZE = 4
 PER_DEVICE_EVAL_BATCH_SIZE  = 4
 GRADIENT_ACCUMULATION_STEPS = 2
 FP16                        = torch.cuda.is_available()
-EVAL_STEPS                  = 300
-SAVE_STEPS                  = 300
-LOGGING_STEPS               = 50
+EVAL_STEPS                  = 10
+SAVE_STEPS                  = 10
+LOGGING_STEPS               = 10
 SAVE_TOTAL_LIMIT            = 2
 TOTAL_RUNS                  = 5
 
@@ -127,39 +137,32 @@ class Wav2Vec2DANNFinetune(Wav2Vec2PreTrainedModel):
     """
     def __init__(self, config):
         super().__init__(config)
-        self.wav2vec2      = Wav2Vec2Model(config)
-        hidden             = config.hidden_size   # 768
-        num_labels         = config.num_labels    # 2
-        num_speakers       = getattr(config, "num_speakers", 38)
-        self.pooling_mode  = getattr(config, "pooling_mode", "mean")
+        self.wav2vec2     = Wav2Vec2Model(config)
+        hidden            = config.hidden_size
+        num_labels        = config.num_labels
+        num_speakers      = getattr(config, "num_speakers", 151)
+        self.pooling_mode = getattr(config, "pooling_mode", "mean")
 
-        # Shared Encoder：768 → 128（同舊 DANN）
         self.shared_encoder = nn.Sequential(
             nn.Linear(hidden, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.3),
         )
-
-        # Depression Classifier
         self.dep_classifier = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, num_labels),
         )
-
-        # Speaker Classifier（接 GRL）
         self.spk_classifier = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, num_speakers),
         )
-
         self.grl = GradientReversalLayer()
         self.init_weights()
 
     def freeze_feature_extractor(self):
-        """只凍結 CNN，Transformer 保持可訓練（同 Huang）"""
         self.wav2vec2.feature_extractor._freeze_parameters()
 
     def merged_strategy(self, hidden_states):
@@ -190,21 +193,14 @@ class Wav2Vec2DANNFinetune(Wav2Vec2PreTrainedModel):
             return_dict=return_dict,
         )
 
-        # Mean pooling → 768 維
         pooled = self.merged_strategy(outputs[0])
-
-        # Shared Encoder → 128 維
         shared = self.shared_encoder(pooled)
 
-        # Depression 分支
         dep_logits = self.dep_classifier(shared)
-
-        # Speaker 分支（GRL）
-        rev = self.grl(shared, alpha)
+        rev        = self.grl(shared, alpha)
         spk_logits = self.spk_classifier(rev)
 
-        # Loss 計算
-        loss = None
+        loss     = None
         loss_dep = None
         loss_spk = None
 
@@ -215,11 +211,16 @@ class Wav2Vec2DANNFinetune(Wav2Vec2PreTrainedModel):
             loss = loss_dep
 
         if speaker_labels is not None:
-            num_speakers = spk_logits.size(-1)
-            loss_spk = nn.CrossEntropyLoss()(
-                spk_logits.view(-1, num_speakers), speaker_labels.view(-1)
-            )
-            loss = loss_dep + loss_spk if loss_dep is not None else loss_spk
+            # [v3-2] 只對 speaker_labels >= 0 計算 L_spk
+            # train 路人 >= 0，test 陌生人 = -1 不參與
+            mask = speaker_labels >= 0
+            if mask.sum() > 0:
+                num_spk  = spk_logits.size(-1)
+                loss_spk = nn.CrossEntropyLoss()(
+                    spk_logits[mask].view(-1, num_spk),
+                    speaker_labels[mask].view(-1)
+                )
+                loss = loss_dep + loss_spk if loss_dep is not None else loss_spk
 
         if not return_dict:
             output = (dep_logits,) + outputs[2:]
@@ -235,7 +236,7 @@ class Wav2Vec2DANNFinetune(Wav2Vec2PreTrainedModel):
         )
 
 # ============================================================
-#  DataCollator（含 speaker_labels）
+#  DataCollator
 # ============================================================
 @dataclass
 class DataCollatorDANN:
@@ -247,9 +248,9 @@ class DataCollatorDANN:
     def __call__(
         self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
     ) -> Dict[str, torch.Tensor]:
-        input_features  = [{"input_values": f["input_values"]} for f in features]
-        label_features  = [f["labels"]          for f in features]
-        speaker_features = [f["speaker_label"]  for f in features]
+        input_features   = [{"input_values": f["input_values"]} for f in features]
+        label_features   = [f["labels"]        for f in features]
+        speaker_features = [f["speaker_label"] for f in features]
 
         batch = self.processor.pad(
             input_features,
@@ -263,12 +264,10 @@ class DataCollatorDANN:
         return batch
 
 # ============================================================
-#  compute_metrics（憂鬱症分類，對齊 Huang）
+#  compute_metrics — [v3-3] 加入 f1，對齊 Huang A
 # ============================================================
 def compute_metrics(p: EvalPrediction):
-    # p.predictions 可能會把 loss_dep, loss_spk, logits 通通裝在 tuple 裡
     if isinstance(p.predictions, tuple):
-        # 我們只找維度是 2 的那個陣列（也就是 logits，形狀為 [batch_size, 2]）
         for pred_array in p.predictions:
             if isinstance(pred_array, np.ndarray) and pred_array.ndim == 2:
                 preds = pred_array
@@ -277,10 +276,12 @@ def compute_metrics(p: EvalPrediction):
         preds = p.predictions
 
     preds = np.argmax(preds, axis=1)
-    return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
+    acc = accuracy_score(p.label_ids, preds)
+    f1  = f1_score(p.label_ids, preds, average="macro")
+    return {"accuracy": acc, "f1": f1}
 
 # ============================================================
-#  DANNTrainer — 在 training_step 加入 speaker loss 和動態 alpha
+#  DANNTrainer
 # ============================================================
 if version.parse(torch.__version__) >= version.parse("1.6"):
     _is_native_amp_available = True
@@ -297,12 +298,9 @@ class DANNTrainer(Trainer):
         model.train()
         inputs = self._prepare_inputs(inputs)
 
-        # 動態 alpha（同舊 DANN，從 0 漸增到 1）
         p     = self.current_step / max(self.total_steps, 1)
         alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1
         self.current_step += 1
-
-        # 注入 alpha
         inputs["alpha"] = alpha
 
         is_amp = self.args.fp16 or self.args.bf16
@@ -333,10 +331,16 @@ class DANNTrainer(Trainer):
 def extract_speaker_id(filepath):
     return os.path.basename(str(filepath)).split('_')[0]
 
-def build_speaker_map(csv_path):
-    df = pd.read_csv(csv_path)
+def build_speaker_map(train_csv_path):
+    """
+    Scenario A：Speaker Map 從 train.csv 建立（~151 位路人）
+    test 的 38 位 Target Group 不在此 map，load 時給 -1
+    """
+    df = pd.read_csv(train_csv_path)
     speakers = sorted(df['path'].apply(extract_speaker_id).unique())
-    return {spk: idx for idx, spk in enumerate(speakers)}
+    speaker_map = {spk: idx for idx, spk in enumerate(speakers)}
+    print(f"🔍 [v3] Speaker Map 從 train 建立: {len(speaker_map)} 位路人")
+    return speaker_map
 
 def load_audio_dataset(csv_path: str, speaker_map: dict) -> HFDataset:
     df = pd.read_csv(csv_path)
@@ -359,12 +363,17 @@ def load_audio_dataset(csv_path: str, speaker_map: dict) -> HFDataset:
         records.append({
             "path":         wav_path,
             "label":        LABEL_MAP[raw_label],
-            "speaker_label": speaker_map.get(spk_id, 0),
+            # [v3-1] 路人在 map → 正確 index；test 陌生人不在 map → -1
+            "speaker_label": speaker_map.get(spk_id, -1),
         })
 
     if skipped > 0:
         print(f"⚠️ 跳過 {skipped} 筆")
-    print(f"✅ 成功載入 {len(records)} 筆")
+
+    n_known   = sum(1 for r in records if r["speaker_label"] >= 0)
+    n_unknown = sum(1 for r in records if r["speaker_label"] < 0)
+    print(f"✅ 成功載入 {len(records)} 筆 "
+          f"(已知路人: {n_known}, 陌生人 s=-1: {n_unknown})")
 
     return HFDataset.from_dict({
         "path":          [r["path"]          for r in records],
@@ -379,7 +388,9 @@ def speech_file_to_array_fn(batch, processor):
     speech_array = speech_array.squeeze().numpy()
     if sampling_rate != 16000:
         import librosa
-        speech_array = librosa.resample(speech_array, orig_sr=sampling_rate, target_sr=16000)
+        speech_array = librosa.resample(
+            speech_array, orig_sr=sampling_rate, target_sr=16000
+        )
     batch["speech"] = speech_array
     return batch
 
@@ -391,8 +402,8 @@ def preprocess_function(batch, processor):
         padding=False,
         return_attention_mask=False,
     )
-    batch["input_values"] = result.input_values[0]
-    batch["labels"]       = batch["label"]
+    batch["input_values"]  = result.input_values[0]
+    batch["labels"]        = batch["label"]
     batch["speaker_label"] = batch["speaker_label"]
     return batch
 
@@ -402,15 +413,13 @@ def preprocess_function(batch, processor):
 def full_evaluation(trainer, test_dataset, output_dir, run_i):
     predictions = trainer.predict(test_dataset)
     preds = predictions.predictions
-    
-    # --- 加入防呆邏輯 ---
+
     if isinstance(preds, tuple):
         for pred_array in preds:
             if isinstance(pred_array, np.ndarray) and pred_array.ndim == 2:
                 preds = pred_array
                 break
-    # ------------------
-    
+
     y_pred = np.argmax(preds, axis=1)
     y_true = predictions.label_ids
 
@@ -458,25 +467,28 @@ def full_evaluation(trainer, test_dataset, output_dir, run_i):
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 DANN + Fine-tuned Transformer — Scenario A")
+    print("🚀 DANN + Fine-tuned Transformer — Scenario A  [v3]")
     print("   CNN: Frozen | Transformer: Trainable | GRL: On")
-    print(f"   實驗次數: {TOTAL_RUNS} 次")
+    print("   Speaker Map: train 路人（~151位）")
+    print("   Test 陌生人 speaker_label = -1，不參與 L_spk（論文 N/A）")
+    print(f"   實驗次數: {TOTAL_RUNS} 次，最後輸出平均與標準差")
     print("=" * 60)
 
-    processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+    processor  = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
     map_kwargs = {"fn_kwargs": {"processor": processor}}
 
-    # Speaker map 從 train set 建立
-    print("\n🔍 建立 Speaker Map...")
+    # Speaker Map 從 train 建立（~151 位路人）
+    print("\n🔍 建立 Speaker Map（從 train.csv）...")
     speaker_map  = build_speaker_map(TRAIN_CSV)
     num_speakers = len(speaker_map)
-    print(f"   共 {num_speakers} 位說話者")
+    print(f"✅ num_speakers = {num_speakers}")
 
     # 資料只載入一次
-    print("\n📦 載入並預處理資料集...")
+    print("\n📦 載入並預處理資料集（只執行一次）...")
     train_raw = load_audio_dataset(TRAIN_CSV, speaker_map)
     test_raw  = load_audio_dataset(TEST_CSV,  speaker_map)
 
+    # 預期：train 全是已知路人（n_unknown=0）；test 全是陌生人（n_known=0）
     train_raw = train_raw.map(speech_file_to_array_fn, **map_kwargs)
     test_raw  = test_raw.map(speech_file_to_array_fn,  **map_kwargs)
 
@@ -497,25 +509,26 @@ if __name__ == "__main__":
 
         run_seed = SEED + run_i - 1
         set_seed(run_seed)
+        print(f"🎲 Run {run_i} seed: {run_seed}")
 
-        # 模型初始化
         config = Wav2Vec2Config.from_pretrained(
             MODEL_NAME,
             num_labels=2,
             final_dropout=0.1,
             pooling_mode="mean",
         )
-        config.num_speakers = num_speakers  # <--- 🔴 強制寫入 config，不讓它被忽略！
+        config.num_speakers = num_speakers
         model = Wav2Vec2DANNFinetune.from_pretrained(MODEL_NAME, config=config)
-        model.freeze_feature_extractor()   # 只凍結 CNN
+        model.freeze_feature_extractor()
         print(f"❄️ CNN 已凍結，Transformer 可訓練")
 
         run_output_dir = os.path.join(OUTPUT_DIR, f"run_{run_i}")
         os.makedirs(run_output_dir, exist_ok=True)
 
-        # 計算 total_steps 供 alpha 動態調整
-        steps_per_epoch = len(train_dataset) // (PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)
-        total_steps     = steps_per_epoch * NUM_EPOCHS
+        steps_per_epoch = len(train_dataset) // (
+            PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
+        )
+        total_steps = steps_per_epoch * NUM_EPOCHS
 
         training_args = TrainingArguments(
             output_dir=run_output_dir,
@@ -531,12 +544,13 @@ if __name__ == "__main__":
             learning_rate=LEARNING_RATE,
             save_total_limit=SAVE_TOTAL_LIMIT,
             seed=run_seed,
-            remove_unused_columns=False,
             data_seed=run_seed,
             load_best_model_at_end=True,
+            metric_for_best_model="f1",    # [v3-4] 對齊 Huang A
+            greater_is_better=True,
+            remove_unused_columns=False,
             report_to="none",
-            # 💡 [關鍵修復]：丟棄最後一個未滿 batch_size 的 batch，防止 BatchNorm 崩潰！
-            dataloader_drop_last=True,
+            dataloader_drop_last=True,     # 防止 BatchNorm 崩潰
         )
 
         trainer = DANNTrainer(
@@ -545,7 +559,7 @@ if __name__ == "__main__":
             args=training_args,
             compute_metrics=compute_metrics,
             train_dataset=train_dataset,
-            eval_dataset=test_dataset,
+            eval_dataset=test_dataset,     # 對齊 Huang A（無獨立 valid set）
             tokenizer=processor.feature_extractor,
             total_steps=total_steps,
         )
@@ -565,7 +579,6 @@ if __name__ == "__main__":
         processor.save_pretrained(best_model_path)
         print(f"💾 Run {run_i} 最佳模型已儲存: {best_model_path}")
 
-        # 同時存 shared_encoder 供 speaker probe 使用
         torch.save(
             model.shared_encoder.state_dict(),
             f"dann_finetune_A_shared_encoder_run_{run_i}.pth"
@@ -575,7 +588,8 @@ if __name__ == "__main__":
         results = full_evaluation(trainer, test_dataset, OUTPUT_DIR, run_i)
         results["run"] = run_i
         all_results.append(results)
-        print(f"Run {run_i} → Acc: {results['accuracy']:.4f} | F1: {results['f1']:.4f} | AUC: {results['auc']:.4f}")
+        print(f"Run {run_i} → Acc: {results['accuracy']:.4f} | "
+              f"F1: {results['f1']:.4f} | AUC: {results['auc']:.4f}")
 
         import gc
         del model, trainer
@@ -584,7 +598,7 @@ if __name__ == "__main__":
 
     # 彙總
     print(f"\n{'='*60}")
-    print(f"📈 DANN + Finetune Transformer — Scenario A — {TOTAL_RUNS} 次彙總")
+    print(f"📈 DANN + Finetune — Scenario A — {TOTAL_RUNS} 次彙總")
     print(f"{'='*60}")
 
     results_df = pd.DataFrame(all_results)
