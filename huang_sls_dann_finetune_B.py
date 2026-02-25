@@ -217,7 +217,7 @@ class DataCollatorWithSpeaker:
 def compute_metrics(p: EvalPrediction):
     preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
     preds = np.argmax(preds, axis=1)
-    true_labels = p.label_ids[0] if isinstance(p.label_ids, tuple) else p.label_ids
+    true_labels = p.label_ids[0] if isinstance(p.label_ids, tuple) or (isinstance(p.label_ids, np.ndarray) and p.label_ids.ndim == 2) else p.label_ids
     acc = accuracy_score(true_labels, preds)
     f1  = f1_score(true_labels, preds, average="macro")
     return {"accuracy": acc, "f1": f1}
@@ -419,6 +419,8 @@ if __name__ == "__main__":
         training_args = TrainingArguments(
             output_dir=run_output_dir,
             per_device_train_batch_size=BATCH_SIZE,
+            label_names=["labels"],
+            dataloader_drop_last=True,
             per_device_eval_batch_size=BATCH_SIZE,
             gradient_accumulation_steps=GRAD_ACCUM,
             evaluation_strategy="steps",

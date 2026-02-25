@@ -513,6 +513,8 @@ if __name__ == "__main__":
         training_args = TrainingArguments(
             output_dir=run_output_dir,
             per_device_train_batch_size=BATCH_SIZE,
+            label_names=["labels"],
+            dataloader_drop_last=True,
             per_device_eval_batch_size=BATCH_SIZE,
             gradient_accumulation_steps=GRAD_ACCUM,
             evaluation_strategy="steps",
