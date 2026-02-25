@@ -137,7 +137,7 @@ class Wav2Vec2_SLS_DANN(Wav2Vec2PreTrainedModel):
             nn.Dropout(0.3),
         )
         self.dep_classifier = nn.Linear(128, config.num_labels)
-        self.spk_classifier = nn.Linear(128, getattr(config, "num_speakers", 38))
+        self.spk_classifier = nn.Linear(128, 200)
 
         # alpha 由 CTCTrainer 在每個 step 前更新
         self._alpha = 0.0
@@ -484,11 +484,9 @@ if __name__ == "__main__":
 
         set_seed(SEED + run_i)  # 每次 run 用不同 seed，確保隨機性
 
-        # train/valid 每次重新切（seed 不同 → 切法略不同，增加多樣性）
-        train_dataset, eval_dataset = split_train_valid(
-            train_dataset_full, valid_ratio=0.15, seed=SEED + run_i
-        )
-        print(f"📊 Train: {len(train_dataset)} | Valid: {len(eval_dataset)} | Test: {len(test_dataset)}")
+        train_dataset = train_dataset_full
+        eval_dataset  = test_dataset
+        print(f"📊 Train: {len(train_dataset)} | Test(eval): {len(test_dataset)}")
 
         # 每次重新初始化模型（修正 6：config 設定 output_hidden_states）
         config = Wav2Vec2Config.from_pretrained(
@@ -530,6 +528,7 @@ if __name__ == "__main__":
             load_best_model_at_end=True,
             # metric_for_best_model 未設定 → 預設用 validation loss，對齊 train.py
             report_to="none",
+            remove_unused_columns=False,  # 🔥 防止 Trainer 刪掉 speaker_labels
         )
 
         trainer = CTCTrainer(
