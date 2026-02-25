@@ -198,8 +198,8 @@ class Wav2Vec2_SLS_DANN(Wav2Vec2PreTrainedModel):
             loss=loss,
             logits=dep_logits,
             speaker_logits=spk_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            hidden_states=None,
+            attentions=None,
         )
 
 

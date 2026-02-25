@@ -1,23 +1,21 @@
 """
-XLS-R + eGeMAPS + DANN（Fine-tune Transformer，Scenario A）
-===========================================================
-與 xlsr_egemaps_dann_B.py（無 fine-tune）的差異：
-  - XLS-R 的 CNN 凍結，Transformer 可訓練
-  - LR 從 1e-4 降至 1e-5
-  - Scenario A：speaker map 從 train 建立（~151 位路人），
-    test 38 位陌生人 speaker_label = -1（不參與 L_spk）
+Huang + SLS + DANN（Fine-tune Transformer，Scenario A）
+=======================================================
+與 huang_sls_dann_no_finetune_A.py 的唯一差異：
+  - wav2vec2 的 CNN 凍結，Transformer 可訓練（對齊 DANN-FT 設計）
+  - LR 從 1e-4 降至 1e-5（fine-tune 標準）
   - 每次 run 結束後儲存 down_proj.state_dict() → .pth（供 probe 使用）
 
-存檔路徑：./output_xlsr_egemaps_dann_finetune_A/xlsr_egemaps_dann_finetune_B_shared_encoder_run_{run_i}.pth
+存檔路徑：./output_huang_sls_dann_finetune_A/sls_dann_finetune_A_shared_encoder_run_{run_i}.pth
 """
 
 import os
+import copy
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torchaudio
-import opensmile
 import matplotlib.pyplot as plt
 
 from dataclasses import dataclass
@@ -27,7 +25,7 @@ from math import sqrt, exp
 from torch.autograd import Function
 from datasets import Dataset as HFDataset
 from transformers import (
-    Wav2Vec2FeatureExtractor,
+    Wav2Vec2Processor,
     Wav2Vec2Config,
     Wav2Vec2PreTrainedModel,
     Wav2Vec2Model,
@@ -46,13 +44,12 @@ from sklearn.metrics import (
 # ============================================================
 #  設定區
 # ============================================================
-TRAIN_CSV  = "./experiment_sisman_scientific/scenario_B_monitoring/train.csv"
-TEST_CSV   = "./experiment_sisman_scientific/scenario_B_monitoring/test.csv"
+TRAIN_CSV  = "./experiment_sisman_scientific/scenario_A_screening/train.csv"
+TEST_CSV   = "./experiment_sisman_scientific/scenario_A_screening/test.csv"
 AUDIO_ROOT = "/export/fs05/hyeh10/depression/daic_5utt_full/merged_5"
 
-MODEL_NAME  = "facebook/wav2vec2-xls-r-300m"
-OUTPUT_DIR  = "./output_xlsr_egemaps_dann_finetune_B"
-EGEMAPS_DIM = 88
+MODEL_NAME = "facebook/wav2vec2-base"
+OUTPUT_DIR = "./output_huang_sls_dann_finetune_A"
 
 SEED             = 103   # 對齊其他 fine-tune 模型
 TOTAL_RUNS       = 5
@@ -70,14 +67,9 @@ LABEL_MAP   = {"non": 0, "0": 0, 0: 0, "dep": 1, "1": 1, 1: 1}
 LABEL_NAMES = ["non-depressed", "depressed"]
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
-SMILE = opensmile.Smile(
-    feature_set=opensmile.FeatureSet.eGeMAPSv02,
-    feature_level=opensmile.FeatureLevel.Functionals,
-)
-
 
 # ============================================================
-#  ModelOutput & GRL
+#  ModelOutput
 # ============================================================
 @dataclass
 class SpeechClassifierOutput(ModelOutput):
@@ -88,6 +80,9 @@ class SpeechClassifierOutput(ModelOutput):
     attentions:     Optional[Tuple[torch.FloatTensor]] = None
 
 
+# ============================================================
+#  GRL
+# ============================================================
 class GradientReversalFn(Function):
     @staticmethod
     def forward(ctx, x, alpha):
@@ -101,32 +96,35 @@ class GradientReversalFn(Function):
 # ============================================================
 #  模型定義（Fine-tune 版：CNN 凍結，Transformer 可訓練）
 # ============================================================
-class XLSR_eGeMaps_DANN_FT(Wav2Vec2PreTrainedModel):
+class Wav2Vec2_SLS_DANN_FT(Wav2Vec2PreTrainedModel):
     """
-    XLS-R (CNN frozen, Transformer trainable) + eGeMAPS concat + DANN
-    - XLS-R mean pooling: 1024 維
-    - eGeMAPS functionals: 88 維
-    - concat → down_proj(256) → dep/spk classifier
+    Wav2Vec2 + SLS + DANN，Fine-tune Transformer
+    - CNN feature extractor：凍結
+    - Transformer encoder：可訓練
+    - SLS 加權融合所有 hidden states
+    - dep_classifier + spk_classifier (GRL)
     """
-    def __init__(self, config, egemaps_dim: int = EGEMAPS_DIM):
+    def __init__(self, config):
         super().__init__(config)
         self.wav2vec2 = Wav2Vec2Model(config)
 
         # 只凍結 CNN，Transformer 可訓練
         self.wav2vec2.feature_extractor._freeze_parameters()
 
-        combined_dim = config.hidden_size + egemaps_dim  # 1024 + 88 = 1112
+        num_layers = config.num_hidden_layers + 1  # +1 for CNN embedding output
+        self.sls_weights = nn.Parameter(torch.ones(num_layers))
+
         self.down_proj = nn.Sequential(
-            nn.Linear(combined_dim, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(config.hidden_size, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.3),
         )
         self.dep_classifier = nn.Sequential(
-            nn.Linear(256, 64), nn.ReLU(), nn.Linear(64, config.num_labels)
+            nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, config.num_labels)
         )
         self.spk_classifier = nn.Sequential(
-            nn.Linear(256, 64), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
             nn.Linear(64, getattr(config, "num_speakers", 151))
         )
 
@@ -136,40 +134,40 @@ class XLSR_eGeMaps_DANN_FT(Wav2Vec2PreTrainedModel):
     def freeze_feature_extractor(self):
         self.wav2vec2.feature_extractor._freeze_parameters()
 
-    def get_embedding(self, input_values, egemaps_feat=None, attention_mask=None):
-        """供 probe 使用：回傳 down_proj 後 256 維 embedding"""
-        outputs  = self.wav2vec2(input_values, attention_mask=attention_mask, return_dict=True)
-        xlsr_feat = torch.mean(outputs.last_hidden_state, dim=1)
-        if egemaps_feat is not None:
-            egemaps_feat = egemaps_feat.to(xlsr_feat.dtype)
-            combined = torch.cat([xlsr_feat, egemaps_feat], dim=-1)
-        else:
-            zero_pad = torch.zeros(xlsr_feat.size(0), EGEMAPS_DIM, dtype=xlsr_feat.dtype, device=xlsr_feat.device)
-            combined = torch.cat([xlsr_feat, zero_pad], dim=-1)
-        return self.down_proj(combined)
+    def get_embedding(self, input_values, attention_mask=None):
+        """供 probe 使用：回傳 down_proj 後 128 維 embedding"""
+        outputs = self.wav2vec2(
+            input_values, attention_mask=attention_mask,
+            output_hidden_states=True, return_dict=True,
+        )
+        hidden_states = torch.stack(outputs.hidden_states)  # [L, B, T, H]
+        weights = torch.softmax(self.sls_weights, dim=0)
+        fused   = (hidden_states * weights.view(-1, 1, 1, 1)).sum(0)
+        return self.down_proj(torch.mean(fused, dim=1))
 
     def forward(
         self,
         input_values,
         attention_mask=None,
-        egemaps_feat=None,
         labels=None,
         speaker_labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
     ):
-        outputs   = self.wav2vec2(input_values, attention_mask=attention_mask, return_dict=True)
-        xlsr_feat = torch.mean(outputs.last_hidden_state, dim=1)
+        outputs = self.wav2vec2(
+            input_values,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            output_attentions=output_attentions,
+            return_dict=True,
+        )
 
-        if egemaps_feat is not None:
-            egemaps_feat = egemaps_feat.to(xlsr_feat.dtype)
-            combined = torch.cat([xlsr_feat, egemaps_feat], dim=-1)
-        else:
-            zero_pad = torch.zeros(xlsr_feat.size(0), EGEMAPS_DIM, dtype=xlsr_feat.dtype, device=xlsr_feat.device)
-            combined = torch.cat([xlsr_feat, zero_pad], dim=-1)
+        hidden_states = torch.stack(outputs.hidden_states)
+        weights = torch.softmax(self.sls_weights, dim=0)
+        fused   = (hidden_states * weights.view(-1, 1, 1, 1)).sum(0)
+        shared  = self.down_proj(torch.mean(fused, dim=1))
 
-        shared     = self.down_proj(combined)
         dep_logits = self.dep_classifier(shared)
         spk_logits = self.spk_classifier(GradientReversalFn.apply(shared, self._alpha))
 
@@ -190,15 +188,17 @@ class XLSR_eGeMaps_DANN_FT(Wav2Vec2PreTrainedModel):
             loss=loss,
             logits=dep_logits,
             speaker_logits=spk_logits,
+            hidden_states=None,
+            attentions=None,
         )
 
 
 # ============================================================
-#  DataCollator（含 egemaps_feat + speaker_labels）
+#  DataCollator
 # ============================================================
 @dataclass
-class DataCollatorWithEGeMAPSAndSpeaker:
-    processor: Wav2Vec2FeatureExtractor
+class DataCollatorWithSpeaker:
+    processor: Wav2Vec2Processor
     padding: Union[bool, str] = True
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -208,9 +208,6 @@ class DataCollatorWithEGeMAPSAndSpeaker:
         )
         batch["labels"]         = torch.tensor([f["labels"]         for f in features], dtype=torch.long)
         batch["speaker_labels"] = torch.tensor([f["speaker_labels"] for f in features], dtype=torch.long)
-        batch["egemaps_feat"]   = torch.tensor(
-            np.stack([f["egemaps_feat"] for f in features]), dtype=torch.float32
-        )
         return batch
 
 
@@ -221,14 +218,13 @@ def compute_metrics(p: EvalPrediction):
     preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
     preds = np.argmax(preds, axis=1)
     true_labels = p.label_ids[0] if isinstance(p.label_ids, tuple) else p.label_ids
-    return {
-        "accuracy": accuracy_score(true_labels, preds),
-        "f1":       f1_score(true_labels, preds, average="macro"),
-    }
+    acc = accuracy_score(true_labels, preds)
+    f1  = f1_score(true_labels, preds, average="macro")
+    return {"accuracy": acc, "f1": f1}
 
 
 # ============================================================
-#  CTCTrainer
+#  CTCTrainer — 動態注入 alpha
 # ============================================================
 class CTCTrainer(Trainer):
     def training_step(self, model: nn.Module, inputs: Dict[str, Any]) -> torch.Tensor:
@@ -274,33 +270,14 @@ def extract_speaker_id(filepath: str) -> str:
     return os.path.basename(filepath).split("_")[0]
 
 
-def extract_egemaps(wav_path: str) -> np.ndarray:
-    try:
-        waveform, sr = torchaudio.load(wav_path)
-        if waveform.shape[0] > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
-        if sr != 16000:
-            waveform = torchaudio.functional.resample(waveform, sr, 16000)
-        signal = waveform.squeeze().numpy()
-        feat   = SMILE.process_signal(signal, 16000).values.flatten().astype(np.float32)
-        return np.nan_to_num(feat, nan=0.0)
-    except Exception as e:
-        print(f"⚠️ eGeMAPS 提取失敗: {wav_path} → {e}")
-        return np.zeros(EGEMAPS_DIM, dtype=np.float32)
-
-
 def load_audio_dataset(csv_path: str, speaker_to_idx: dict = None, is_train: bool = True):
     df = pd.read_csv(csv_path)
     print(f"📂 讀取 {csv_path}，共 {len(df)} 筆資料")
 
     if is_train and speaker_to_idx is None:
-        # Scenario B：speaker map 從 TEST_CSV 建立（只含 38 位 target）
-        # 路人的 speaker_label = -1，不參與 L_spk
-        import pandas as _pd_tmp
-        test_df = _pd_tmp.read_csv(TEST_CSV)
-        target_speakers = sorted(set(extract_speaker_id(p) for p in test_df["path"].tolist()))
-        speaker_to_idx  = {spk: idx for idx, spk in enumerate(target_speakers)}
-        print(f"🔍 偵測到 {len(speaker_to_idx)} 位 target speaker（從 TEST_CSV，應為 38）")
+        all_speakers   = sorted(set(extract_speaker_id(p) for p in df["path"].tolist()))
+        speaker_to_idx = {spk: idx for idx, spk in enumerate(all_speakers)}
+        print(f"🔍 偵測到 {len(speaker_to_idx)} 位 speaker（train，~151 位路人）")
 
     records = []
     for _, row in df.iterrows():
@@ -325,16 +302,14 @@ def load_audio_dataset(csv_path: str, speaker_to_idx: dict = None, is_train: boo
 
 
 def speech_file_to_array_fn(batch, processor):
-    wav_path = batch["path"]
-    speech, sr = torchaudio.load(wav_path)
+    speech, sr = torchaudio.load(batch["path"])
     if speech.shape[0] > 1:
         speech = torch.mean(speech, dim=0, keepdim=True)
     speech = speech.squeeze().numpy()
     if sr != 16000:
         import librosa
         speech = librosa.resample(speech, orig_sr=sr, target_sr=16000)
-    batch["speech"]       = speech
-    batch["egemaps_feat"] = extract_egemaps(wav_path)
+    batch["speech"] = speech
     return batch
 
 
@@ -379,7 +354,7 @@ def full_evaluation(trainer, test_dataset, output_dir, run_i):
     plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
     plt.xlim([0, 1]); plt.ylim([0, 1.05])
     plt.xlabel("FPR"); plt.ylabel("TPR")
-    plt.title(f"ROC - XLS-R+eGeMAPS+DANN FT Scenario B Run {run_i}")
+    plt.title(f"ROC - SLS+DANN FT Scenario A Run {run_i}")
     plt.legend(); plt.savefig(os.path.join(results_path, "roc_curve.png")); plt.close()
 
     acc = accuracy_score(y_true, y_pred)
@@ -393,23 +368,21 @@ def full_evaluation(trainer, test_dataset, output_dir, run_i):
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 XLS-R + eGeMAPS + DANN（Fine-tune Transformer）— Scenario B
-   Spk Map：從 TEST_CSV 建立（38 位 target），路人 speaker_label=-1")
+    print("🚀 Huang + SLS + DANN（Fine-tune Transformer）— Scenario A")
     print("   CNN：凍結 | Transformer：可訓練")
-    print(f"   XLS-R：{MODEL_NAME}  eGeMAPS：{EGEMAPS_DIM} 維")
     print("   down_proj.state_dict() → .pth（供 probe 使用）")
     print("=" * 60)
 
     set_seed(SEED)
-    processor = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_NAME)
+    processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
 
     print("\n📦 載入資料集（只執行一次）...")
     train_dataset_full, speaker_to_idx = load_audio_dataset(TRAIN_CSV, is_train=True)
     test_dataset_raw, _                = load_audio_dataset(TEST_CSV, speaker_to_idx=speaker_to_idx, is_train=False)
     num_speakers = len(speaker_to_idx)
-    print(f"👥 共 {num_speakers} 位 target speaker（應為 38）")
+    print(f"👥 共 {num_speakers} 位 speaker（train 路人）")
 
-    print("\n🔊 預處理音訊 + 提取 eGeMAPS（只執行一次，耗時較長）...")
+    print("\n🔊 預處理音訊（只執行一次）...")
     train_dataset_full = train_dataset_full.map(speech_file_to_array_fn, fn_kwargs={"processor": processor})
     test_dataset_raw   = test_dataset_raw.map(  speech_file_to_array_fn, fn_kwargs={"processor": processor})
     train_dataset_full = train_dataset_full.map(preprocess_function,      fn_kwargs={"processor": processor})
@@ -430,8 +403,9 @@ if __name__ == "__main__":
             num_labels=2,
             num_speakers=num_speakers,
             final_dropout=0.1,
+            output_hidden_states=True,
         )
-        model = XLSR_eGeMaps_DANN_FT.from_pretrained(MODEL_NAME, config=config)
+        model = Wav2Vec2_SLS_DANN_FT.from_pretrained(MODEL_NAME, config=config)
 
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"🔥 可訓練參數: {trainable:,}")
@@ -463,12 +437,12 @@ if __name__ == "__main__":
 
         trainer = CTCTrainer(
             model=model,
-            data_collator=DataCollatorWithEGeMAPSAndSpeaker(processor=processor),
+            data_collator=DataCollatorWithSpeaker(processor=processor),
             args=training_args,
             compute_metrics=compute_metrics,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=processor,
+            tokenizer=processor.feature_extractor,
         )
 
         print("⚔️ 開始訓練...")
@@ -481,13 +455,14 @@ if __name__ == "__main__":
                 continue
             raise e
 
+        # 儲存最佳模型
         best_path = os.path.join(run_output_dir, "best_model")
         trainer.save_model(best_path)
         processor.save_pretrained(best_path)
         print(f"💾 最佳模型儲存至: {best_path}")
 
         # ★ 儲存 down_proj.state_dict() → .pth（供 probe 使用）
-        pth_path = os.path.join(OUTPUT_DIR, f"xlsr_egemaps_dann_finetune_B_shared_encoder_run_{run_i}.pth")
+        pth_path = os.path.join(OUTPUT_DIR, f"sls_dann_finetune_A_shared_encoder_run_{run_i}.pth")
         torch.save(trainer.model.down_proj.state_dict(), pth_path)
         print(f"💾 down_proj 已儲存: {pth_path}")
 
@@ -496,9 +471,10 @@ if __name__ == "__main__":
 
         import gc; del model, trainer; torch.cuda.empty_cache(); gc.collect()
 
+    # 彙總
     if all_results:
         print(f"\n{'='*60}\n📈 跨 Run 統計\n{'='*60}")
         for metric in ["accuracy", "f1", "auc"]:
             vals = [r[metric] for r in all_results]
             print(f"  {metric.upper():10s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}")
-    print("\n🏁 XLS-R+eGeMAPS+DANN FT Scenario B 完成！")
+    print("\n🏁 SLS+DANN FT Scenario A 完成！")

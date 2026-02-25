@@ -8,7 +8,7 @@ XLS-R + eGeMAPS + DANN（Fine-tune Transformer，Scenario A）
     test 38 位陌生人 speaker_label = -1（不參與 L_spk）
   - 每次 run 結束後儲存 down_proj.state_dict() → .pth（供 probe 使用）
 
-存檔路徑：./output_xlsr_egemaps_dann_finetune_A/xlsr_egemaps_dann_finetune_B_shared_encoder_run_{run_i}.pth
+存檔路徑：./output_xlsr_egemaps_dann_finetune_A/xlsr_egemaps_dann_finetune_A_shared_encoder_run_{run_i}.pth
 """
 
 import os
@@ -46,12 +46,12 @@ from sklearn.metrics import (
 # ============================================================
 #  設定區
 # ============================================================
-TRAIN_CSV  = "./experiment_sisman_scientific/scenario_B_monitoring/train.csv"
-TEST_CSV   = "./experiment_sisman_scientific/scenario_B_monitoring/test.csv"
+TRAIN_CSV  = "./experiment_sisman_scientific/scenario_A_screening/train.csv"
+TEST_CSV   = "./experiment_sisman_scientific/scenario_A_screening/test.csv"
 AUDIO_ROOT = "/export/fs05/hyeh10/depression/daic_5utt_full/merged_5"
 
 MODEL_NAME  = "facebook/wav2vec2-xls-r-300m"
-OUTPUT_DIR  = "./output_xlsr_egemaps_dann_finetune_B"
+OUTPUT_DIR  = "./output_xlsr_egemaps_dann_finetune_A"
 EGEMAPS_DIM = 88
 
 SEED             = 103   # 對齊其他 fine-tune 模型
@@ -294,13 +294,10 @@ def load_audio_dataset(csv_path: str, speaker_to_idx: dict = None, is_train: boo
     print(f"📂 讀取 {csv_path}，共 {len(df)} 筆資料")
 
     if is_train and speaker_to_idx is None:
-        # Scenario B：speaker map 從 TEST_CSV 建立（只含 38 位 target）
-        # 路人的 speaker_label = -1，不參與 L_spk
-        import pandas as _pd_tmp
-        test_df = _pd_tmp.read_csv(TEST_CSV)
-        target_speakers = sorted(set(extract_speaker_id(p) for p in test_df["path"].tolist()))
-        speaker_to_idx  = {spk: idx for idx, spk in enumerate(target_speakers)}
-        print(f"🔍 偵測到 {len(speaker_to_idx)} 位 target speaker（從 TEST_CSV，應為 38）")
+        # Scenario A：speaker map 從 train 建立（~151 位路人）
+        all_speakers   = sorted(set(extract_speaker_id(p) for p in df["path"].tolist()))
+        speaker_to_idx = {spk: idx for idx, spk in enumerate(all_speakers)}
+        print(f"🔍 偵測到 {len(speaker_to_idx)} 位 speaker（train，~151 位路人）")
 
     records = []
     for _, row in df.iterrows():
@@ -379,7 +376,7 @@ def full_evaluation(trainer, test_dataset, output_dir, run_i):
     plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
     plt.xlim([0, 1]); plt.ylim([0, 1.05])
     plt.xlabel("FPR"); plt.ylabel("TPR")
-    plt.title(f"ROC - XLS-R+eGeMAPS+DANN FT Scenario B Run {run_i}")
+    plt.title(f"ROC - XLS-R+eGeMAPS+DANN FT Scenario A Run {run_i}")
     plt.legend(); plt.savefig(os.path.join(results_path, "roc_curve.png")); plt.close()
 
     acc = accuracy_score(y_true, y_pred)
@@ -393,8 +390,8 @@ def full_evaluation(trainer, test_dataset, output_dir, run_i):
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 XLS-R + eGeMAPS + DANN（Fine-tune Transformer）— Scenario B
-   Spk Map：從 TEST_CSV 建立（38 位 target），路人 speaker_label=-1")
+    print("🚀 XLS-R + eGeMAPS + DANN（Fine-tune Transformer）— Scenario A
+   Spk Map：從 train.csv 建立（~151 位路人），test 陌生人 speaker_label=-1")
     print("   CNN：凍結 | Transformer：可訓練")
     print(f"   XLS-R：{MODEL_NAME}  eGeMAPS：{EGEMAPS_DIM} 維")
     print("   down_proj.state_dict() → .pth（供 probe 使用）")
@@ -407,7 +404,7 @@ if __name__ == "__main__":
     train_dataset_full, speaker_to_idx = load_audio_dataset(TRAIN_CSV, is_train=True)
     test_dataset_raw, _                = load_audio_dataset(TEST_CSV, speaker_to_idx=speaker_to_idx, is_train=False)
     num_speakers = len(speaker_to_idx)
-    print(f"👥 共 {num_speakers} 位 target speaker（應為 38）")
+    print(f"👥 共 {num_speakers} 位 speaker（train 路人）")
 
     print("\n🔊 預處理音訊 + 提取 eGeMAPS（只執行一次，耗時較長）...")
     train_dataset_full = train_dataset_full.map(speech_file_to_array_fn, fn_kwargs={"processor": processor})
@@ -487,7 +484,7 @@ if __name__ == "__main__":
         print(f"💾 最佳模型儲存至: {best_path}")
 
         # ★ 儲存 down_proj.state_dict() → .pth（供 probe 使用）
-        pth_path = os.path.join(OUTPUT_DIR, f"xlsr_egemaps_dann_finetune_B_shared_encoder_run_{run_i}.pth")
+        pth_path = os.path.join(OUTPUT_DIR, f"xlsr_egemaps_dann_finetune_A_shared_encoder_run_{run_i}.pth")
         torch.save(trainer.model.down_proj.state_dict(), pth_path)
         print(f"💾 down_proj 已儲存: {pth_path}")
 
@@ -501,4 +498,4 @@ if __name__ == "__main__":
         for metric in ["accuracy", "f1", "auc"]:
             vals = [r[metric] for r in all_results]
             print(f"  {metric.upper():10s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}")
-    print("\n🏁 XLS-R+eGeMAPS+DANN FT Scenario B 完成！")
+    print("\n🏁 XLS-R+eGeMAPS+DANN FT Scenario A 完成！")

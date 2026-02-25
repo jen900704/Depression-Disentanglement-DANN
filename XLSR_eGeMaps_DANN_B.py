@@ -1,25 +1,25 @@
 """
-File — Huang + SLS + DANN（無 fine-tune，Scenario A）
-=====================================================
+File — XLS-R + eGeMAPS + DANN（無 fine-tune，Scenario B）
+=========================================================
 架構說明：
-  - Wav2Vec2 主幹：完全凍結（包含 CNN feature extractor + Transformer encoder）
-  - SLS (Stochastic Layer Selection)：可學習的加權融合所有 hidden states
-  - DANN domain classifier：對抗式訓練，以 speaker 為 domain
-  - dep_classifier：二元憂鬱分類 (binary)
-
-與 replicate_huang (File 2/3) 的差異：
-  → wav2vec2 全部凍結（非只凍結 CNN），只有 SLS 權重 + 兩個分類頭可訓練
-  → 加入 GRL + speaker domain classifier
-  → 執行 TOTAL_RUNS 次，每次重新初始化 SLS/分類頭權重
+  - XLS-R (wav2vec2-xls-r-300m) 主幹：完全凍結
+  - mean pooling 取最後一層 hidden state → 1024 維
+  - eGeMAPS (opensmile, eGeMAPSv02 Functionals)：88 維
+  - 特徵拼接後 → down_proj → dep_classifier (binary)
+  - DANN：GRL + spk_classifier，alpha 動態遞增
 
 修正清單（相對於使用者提供的草稿）：
   1. import 語法分行
-  2. forward 回傳 SpeechClassifierOutput（ModelOutput 子類），Trainer 才能正確提取 loss
-  3. speaker_labels 從 CSV 抽取後存入 dataset，讓 Trainer 能傳入 forward
-  4. 補上 AUDIO_ROOT
-  5. alpha 動態調整：在自訂 CTCTrainer.training_step 中依全局 step 計算
-  6. config 設定 output_hidden_states=True
-  7. 補完 TOTAL_RUNS 迴圈
+  2. GradientReversalFn 定義位置移至 model 使用前
+  3. forward 回傳 SpeechClassifierOutput (ModelOutput)，Trainer 才能提取 loss
+  4. egemaps_feat 存入 dataset 欄位，DataCollator 負責組 batch
+  5. preprocess_function 補完重採樣邏輯；opensmile 改用 process_signal 避免路徑重複讀取
+  6. speaker_labels 從檔名抽取後存入 dataset
+  7. AUDIO_ROOT / TOTAL_RUNS 等設定補全
+  8. alpha 動態注入 CTCTrainer（與 SLS+DANN 版一致）
+  9. 補完 TOTAL_RUNS 迴圈 + 跨 run 統計
+ 10. config 設定 hidden_size 對應 XLS-R 的 1024
+ 11. Wav2Vec2Processor → Wav2Vec2FeatureExtractor（XLS-R 無 CTC tokenizer）
 """
 
 import os
@@ -28,6 +28,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torchaudio
+import opensmile
 import matplotlib.pyplot as plt
 
 from dataclasses import dataclass
@@ -37,7 +38,7 @@ from math import sqrt, exp
 from torch.autograd import Function
 from datasets import Dataset as HFDataset
 from transformers import (
-    Wav2Vec2Processor,
+    Wav2Vec2FeatureExtractor,   # XLS-R 無 CTC tokenizer，改用 FeatureExtractor
     Wav2Vec2Config,
     Wav2Vec2PreTrainedModel,
     Wav2Vec2Model,
@@ -61,12 +62,13 @@ from sklearn.metrics import (
 # ============================================================
 #  設定區
 # ============================================================
-TRAIN_CSV  = "./experiment_sisman_scientific/scenario_A_screening/train.csv"
-TEST_CSV   = "./experiment_sisman_scientific/scenario_A_screening/test.csv"
-AUDIO_ROOT = "/export/fs05/hyeh10/depression/daic_5utt_full/merged_5"  # ← 修正 1：補上 AUDIO_ROOT
+TRAIN_CSV  = "./experiment_sisman_scientific/scenario_B_monitoring/train.csv"
+TEST_CSV   = "./experiment_sisman_scientific/scenario_B_monitoring/test.csv"
+AUDIO_ROOT = "/export/fs05/hyeh10/depression/daic_5utt_full/merged_5"
 
-MODEL_NAME = "facebook/wav2vec2-base"
-OUTPUT_DIR = "./output_huang_sls_dann_A"
+MODEL_NAME  = "facebook/wav2vec2-xls-r-300m"
+OUTPUT_DIR  = "./output_xlsr_egemaps_dann_B"
+EGEMAPS_DIM = 88   # eGeMAPSv02 Functionals 固定 88 維
 
 SEED       = 42
 TOTAL_RUNS = 5
@@ -84,20 +86,30 @@ LABEL_MAP   = {"non": 0, "0": 0, 0: 0, "dep": 1, "1": 1, 1: 1}
 LABEL_NAMES = ["non-depressed", "depressed"]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# opensmile 初始化（程式啟動時建立一次）
+SMILE = opensmile.Smile(
+    feature_set=opensmile.FeatureSet.eGeMAPSv02,
+    feature_level=opensmile.FeatureLevel.Functionals,
+)
+
 
 # ============================================================
-#  模型定義
+#  ModelOutput
 # ============================================================
 
 @dataclass
 class SpeechClassifierOutput(ModelOutput):
-    # 修正 2：回傳 ModelOutput 子類，Trainer 才能正確提取 loss / logits
+    # 修正 3：回傳 ModelOutput 子類，Trainer 才能正確提取 loss / logits
     loss:           Optional[torch.FloatTensor] = None
     logits:         torch.FloatTensor           = None
     speaker_logits: Optional[torch.FloatTensor] = None
     hidden_states:  Optional[Tuple[torch.FloatTensor]] = None
     attentions:     Optional[Tuple[torch.FloatTensor]] = None
 
+
+# ============================================================
+#  GRL（修正 2：定義在 Model 之前）
+# ============================================================
 
 class GradientReversalFn(Function):
     @staticmethod
@@ -110,115 +122,112 @@ class GradientReversalFn(Function):
         return grad_output.neg() * ctx.alpha, None
 
 
-class Wav2Vec2_SLS_DANN(Wav2Vec2PreTrainedModel):
+# ============================================================
+#  模型定義
+# ============================================================
+
+class XLSR_eGeMaps_DANN(Wav2Vec2PreTrainedModel):
     """
-    Wav2Vec2 + SLS + DANN，無 fine-tune
-    - wav2vec2 全部凍結
-    - SLS 加權融合所有 hidden states（13 層，含 CNN embedding 輸出）
-    - dep_classifier：binary classification
-    - spk_classifier：speaker domain classifier（透過 GRL 對抗）
-    - alpha 由外部 CTCTrainer 動態注入（存於 self._alpha）
+    XLS-R (frozen) + eGeMAPS concat + DANN
+    - xlsr mean pooling: 1024 維
+    - eGeMAPS functionals: 88 維
+    - concat → 1112 維 → down_proj(256) → dep/spk classifier
+    - alpha 由 CTCTrainer 動態注入（self._alpha）
     """
-    def __init__(self, config):
+    def __init__(self, config, egemaps_dim: int = EGEMAPS_DIM):
         super().__init__(config)
         self.wav2vec2 = Wav2Vec2Model(config)
 
-        # 凍結 wav2vec2 全部參數（含 CNN + Transformer）
+        # 凍結 XLS-R 全部參數
         for param in self.wav2vec2.parameters():
             param.requires_grad = False
 
-        num_layers = config.num_hidden_layers + 1  # +1 for CNN embedding output (layer 0)
-        self.sls_weights = nn.Parameter(torch.ones(num_layers))
-
+        combined_dim = config.hidden_size + egemaps_dim  # 1024 + 88 = 1112
         self.down_proj = nn.Sequential(
-            nn.Linear(config.hidden_size, 128),
-            nn.BatchNorm1d(128),
+            nn.Linear(combined_dim, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(0.3),
         )
-        self.dep_classifier = nn.Linear(128, config.num_labels)
-        self.spk_classifier = nn.Linear(128, 200)
+        self.dep_classifier = nn.Linear(256, config.num_labels)
+        self.spk_classifier = nn.Linear(256, getattr(config, "num_speakers", 38))
 
-        # alpha 由 CTCTrainer 在每個 step 前更新
-        self._alpha = 0.0
-
+        self._alpha = 0.0  # 由 CTCTrainer 動態更新
         self.init_weights()
 
     def freeze_feature_extractor(self):
-        # 相容 train.py 呼叫習慣，此處 wav2vec2 已全凍，保留此介面即可
-        pass
+        pass  # 全部已凍結，保留介面相容性
 
     def forward(
         self,
         input_values,
         attention_mask=None,
+        egemaps_feat=None,       # 修正 4：由 dataset 欄位傳入
         labels=None,
-        speaker_labels=None,  # 修正 3：由 dataset 欄位傳入
+        speaker_labels=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
     ):
-        # 修正 6：output_hidden_states 必須為 True，SLS 才能取到所有層
         outputs = self.wav2vec2(
             input_values,
             attention_mask=attention_mask,
-            output_hidden_states=True,  # 強制開啟
             output_attentions=output_attentions,
             return_dict=True,
         )
+        # XLS-R mean pooling over time axis → [B, 1024]
+        xlsr_feat = torch.mean(outputs.last_hidden_state, dim=1)
 
-        # hidden_states: tuple of (num_layers+1) tensors, each [B, T, H]
-        hidden_states = torch.stack(outputs.hidden_states)  # [L, B, T, H]
-        weights = torch.softmax(self.sls_weights, dim=0)    # [L]
-        fused = (hidden_states * weights.view(-1, 1, 1, 1)).sum(0)  # [B, T, H]
+        # eGeMAPS 特徵拼接（修正：確保 dtype 一致）
+        if egemaps_feat is not None:
+            egemaps_feat = egemaps_feat.to(xlsr_feat.dtype)
+            combined = torch.cat([xlsr_feat, egemaps_feat], dim=-1)  # [B, 1112]
+        else:
+            # 推論時若無 eGeMAPS，補零（不影響訓練流程）
+            zero_pad = torch.zeros(
+                xlsr_feat.size(0), EGEMAPS_DIM,
+                dtype=xlsr_feat.dtype, device=xlsr_feat.device
+            )
+            combined = torch.cat([xlsr_feat, zero_pad], dim=-1)
 
-        # Mean pooling over time
-        shared = self.down_proj(torch.mean(fused, dim=1))   # [B, 128]
-
-        dep_logits = self.dep_classifier(shared)             # [B, num_labels]
+        shared     = self.down_proj(combined)                               # [B, 256]
+        dep_logits = self.dep_classifier(shared)                            # [B, 2]
         spk_logits = self.spk_classifier(
-            GradientReversalFn.apply(shared, self._alpha)   # alpha 動態注入
-        )                                                    # [B, num_speakers]
+            GradientReversalFn.apply(shared, self._alpha)
+        )                                                                   # [B, num_speakers]
 
         loss = None
-        if labels is not None:
+        if labels is not None and speaker_labels is not None:
             loss_fct = nn.CrossEntropyLoss()
             dep_loss = loss_fct(dep_logits, labels)
-            loss = dep_loss
-        if speaker_labels is not None:
-            mask = speaker_labels >= 0  # 過濾 test 的陌生人（-1）
-            if mask.sum() > 0:
-                spk_loss = nn.CrossEntropyLoss()(
-                    spk_logits[mask].view(-1, spk_logits.size(-1)),
-                    speaker_labels[mask].view(-1)
-                )
-                loss = loss + self._alpha * spk_loss if loss is not None else spk_loss
+            spk_loss = loss_fct(spk_logits, speaker_labels)
+            loss = dep_loss + self._alpha * spk_loss
 
         return SpeechClassifierOutput(
             loss=loss,
             logits=dep_logits,
             speaker_logits=spk_logits,
-            hidden_states=None,
-            attentions=None,
         )
 
 
 # ============================================================
-#  DataCollator（含 speaker_labels）
+#  DataCollator（含 egemaps_feat + speaker_labels）
 # ============================================================
 
 @dataclass
-class DataCollatorWithSpeaker:
-    processor: Wav2Vec2Processor
+class DataCollatorWithEGeMAPSAndSpeaker:
+    processor: Wav2Vec2FeatureExtractor
     padding: Union[bool, str] = True
 
     def __call__(
         self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
     ) -> Dict[str, torch.Tensor]:
-        input_features = [{"input_values": f["input_values"]} for f in features]
+        input_features   = [{"input_values": f["input_values"]} for f in features]
         label_features   = [f["labels"]          for f in features]
         speaker_features = [f["speaker_labels"]  for f in features]
+        egemaps_features = [f["egemaps_feat"]    for f in features]
 
+        # Wav2Vec2FeatureExtractor.pad 與 Wav2Vec2Processor.pad 介面完全相同
         batch = self.processor.pad(
             input_features,
             padding=self.padding,
@@ -226,6 +235,9 @@ class DataCollatorWithSpeaker:
         )
         batch["labels"]         = torch.tensor(label_features,   dtype=torch.long)
         batch["speaker_labels"] = torch.tensor(speaker_features, dtype=torch.long)
+        batch["egemaps_feat"]   = torch.tensor(
+            np.stack(egemaps_features), dtype=torch.float32
+        )
         return batch
 
 
@@ -242,7 +254,7 @@ def compute_metrics(p: EvalPrediction):
 
 
 # ============================================================
-#  CTCTrainer — 修正 5：動態注入 alpha
+#  CTCTrainer — 動態注入 alpha（修正 8）
 # ============================================================
 
 if version.parse(torch.__version__) >= version.parse("1.6"):
@@ -250,25 +262,16 @@ if version.parse(torch.__version__) >= version.parse("1.6"):
 
 
 class CTCTrainer(Trainer):
-    """
-    在每個 training_step 前，依全局訓練進度動態更新 model._alpha。
-    alpha 公式與 run_dann.py 一致：alpha = 2/(1+exp(-10*p)) - 1，p ∈ [0,1]
-    """
     def training_step(
         self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]
     ) -> torch.Tensor:
-
-        # 計算當前訓練進度 p ∈ [0, 1]
         total_steps = self.args.max_steps if self.args.max_steps > 0 else (
             len(self.train_dataset) // (
                 self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps
             ) * int(self.args.num_train_epochs)
         )
-        current_step = self.state.global_step
-        p = float(current_step) / max(total_steps, 1)
+        p     = float(self.state.global_step) / max(total_steps, 1)
         alpha = 2.0 / (1.0 + exp(-10.0 * p)) - 1.0
-
-        # 注入 alpha 到模型
         model._alpha = alpha
 
         model.train()
@@ -305,18 +308,37 @@ def extract_speaker_id(filepath: str) -> str:
     return os.path.basename(filepath).split("_")[0]
 
 
+def extract_egemaps(wav_path: str) -> np.ndarray:
+    """
+    修正 5：使用 process_signal 避免路徑與 opensmile 格式問題，
+    並做 NaN 填 0 保護。
+    """
+    try:
+        waveform, sr = torchaudio.load(wav_path)
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+        if sr != 16000:
+            waveform = torchaudio.functional.resample(waveform, sr, 16000)
+        # opensmile 需要 numpy 1D array
+        signal = waveform.squeeze().numpy()
+        feat = SMILE.process_signal(signal, 16000).values.flatten().astype(np.float32)
+        feat = np.nan_to_num(feat, nan=0.0)  # NaN 保護
+        return feat
+    except Exception as e:
+        print(f"⚠️ eGeMAPS 提取失敗: {wav_path} → {e}")
+        return np.zeros(EGEMAPS_DIM, dtype=np.float32)
+
+
 def load_audio_dataset(csv_path: str, speaker_to_idx: dict = None, is_train: bool = True):
     """
-    載入 CSV，回傳 HFDataset 及（訓練時建立的）speaker_to_idx。
-    修正 3：speaker_labels 存入 dataset，Trainer 可以直接傳給 forward。
+    載入 CSV，回傳 HFDataset（含 egemaps_feat + speaker_labels）及 speaker_to_idx。
+    修正 4 & 6：egemaps_feat / speaker_labels 在此預先計算並存入 dataset。
     """
     df = pd.read_csv(csv_path)
     print(f"📂 讀取 {csv_path}，共 {len(df)} 筆資料")
 
-    # 建立 speaker → index 對照表（只在訓練集建立）
     if is_train and speaker_to_idx is None:
-        all_wav_paths = df["path"].tolist()
-        all_speakers  = sorted(set(extract_speaker_id(p) for p in all_wav_paths))
+        all_speakers  = sorted(set(extract_speaker_id(p) for p in df["path"].tolist()))
         speaker_to_idx = {spk: idx for idx, spk in enumerate(all_speakers)}
         print(f"🔍 偵測到 {len(speaker_to_idx)} 位 speaker")
 
@@ -335,7 +357,7 @@ def load_audio_dataset(csv_path: str, speaker_to_idx: dict = None, is_train: boo
             continue
 
         spk_str = extract_speaker_id(wav_path)
-        spk_idx = speaker_to_idx.get(spk_str, -1)  # 陌生人(test) → -1，forward 裡 mask 過濾
+        spk_idx = speaker_to_idx.get(spk_str, 0)
 
         records.append({
             "path":           wav_path,
@@ -344,7 +366,7 @@ def load_audio_dataset(csv_path: str, speaker_to_idx: dict = None, is_train: boo
         })
 
     if skipped:
-        print(f"⚠️ 跳過 {skipped} 筆無效/不存在的資料")
+        print(f"⚠️ 跳過 {skipped} 筆無效資料")
     print(f"✅ 成功載入 {len(records)} 筆資料")
 
     dataset = HFDataset.from_dict({
@@ -356,21 +378,35 @@ def load_audio_dataset(csv_path: str, speaker_to_idx: dict = None, is_train: boo
 
 
 def speech_file_to_array_fn(batch, processor):
-    speech_array, sampling_rate = torchaudio.load(batch["path"])
+    """讀取音訊、重採樣，同時提取 eGeMAPS（修正 5：整合在同一 map pass）"""
+    wav_path = batch["path"]
+
+    # 讀取波形
+    speech_array, sampling_rate = torchaudio.load(wav_path)
     if speech_array.shape[0] > 1:
         speech_array = torch.mean(speech_array, dim=0, keepdim=True)
     speech_array = speech_array.squeeze().numpy()
+
     if sampling_rate != 16000:
         import librosa
         speech_array = librosa.resample(speech_array, orig_sr=sampling_rate, target_sr=16000)
-    batch["speech"] = speech_array
+
+    batch["speech"]       = speech_array
+    batch["egemaps_feat"] = extract_egemaps(wav_path)  # 修正 5：同步提取
     return batch
 
 
 def preprocess_function(batch, processor):
-    result = processor(batch["speech"], sampling_rate=16000, return_tensors="np", padding=False)
+    """將 speech array 轉為 input_values，保留 egemaps_feat"""
+    result = processor(
+        batch["speech"],
+        sampling_rate=16000,
+        return_tensors="np",
+        padding=False,
+    )
     batch["input_values"] = result.input_values[0]
     batch["labels"]       = batch["label"]
+    # egemaps_feat 已在 speech_file_to_array_fn 存入，此處直接保留
     return batch
 
 
@@ -394,13 +430,13 @@ def full_evaluation(trainer, test_dataset, output_dir, run_i):
     print("\n" + "=" * 60)
     print(f"📊 [Run {run_i}] Classification Report")
     print("=" * 60)
-    report = classification_report(y_true, y_pred, target_names=LABEL_NAMES,
-                                   zero_division=0, output_dict=True)
+    report    = classification_report(y_true, y_pred, target_names=LABEL_NAMES,
+                                      zero_division=0, output_dict=True)
     report_df = pd.DataFrame(report).transpose()
     print(report_df)
 
-    cm     = confusion_matrix(y_true, y_pred)
-    cm_df  = pd.DataFrame(cm, index=LABEL_NAMES, columns=LABEL_NAMES)
+    cm    = confusion_matrix(y_true, y_pred)
+    cm_df = pd.DataFrame(cm, index=LABEL_NAMES, columns=LABEL_NAMES)
     print("\n📊 Confusion Matrix:")
     print(cm_df)
 
@@ -414,7 +450,6 @@ def full_evaluation(trainer, test_dataset, output_dir, run_i):
 
     results_path = os.path.join(output_dir, f"results_run{run_i}")
     os.makedirs(results_path, exist_ok=True)
-
     report_df.to_csv(os.path.join(results_path, "clsf_report.csv"), sep="\t")
     cm_df.to_csv(    os.path.join(results_path, "conf_matrix.csv"), sep="\t")
 
@@ -423,7 +458,7 @@ def full_evaluation(trainer, test_dataset, output_dir, run_i):
     plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
     plt.xlim([0.0, 1.0]); plt.ylim([0.0, 1.05])
     plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
-    plt.title(f"ROC Curve - Scenario A Run {run_i}")
+    plt.title(f"ROC Curve - Scenario B (XLS-R+eGeMAPS+DANN) Run {run_i}")
     plt.legend(loc="lower right")
     plt.savefig(os.path.join(results_path, "roc_curve.png"))
     plt.close()
@@ -436,32 +471,31 @@ def full_evaluation(trainer, test_dataset, output_dir, run_i):
 
 
 # ============================================================
-#  主程式 — TOTAL_RUNS 次迴圈（修正 7）
+#  主程式 — TOTAL_RUNS 次迴圈（修正 9）
 # ============================================================
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 Huang + SLS + DANN（無 fine-tune）— Scenario A")
-    print("   wav2vec2：全部凍結")
-    print("   SLS 權重 + dep/spk classifier：可訓練")
+    print("🚀 XLS-R + eGeMAPS + DANN（無 fine-tune）— Scenario B")
+    print(f"   XLS-R：全部凍結 ({MODEL_NAME})")
+    print(f"   eGeMAPS：{EGEMAPS_DIM} 維 (eGeMAPSv02 Functionals)")
     print("   DANN alpha：動態遞增")
     print("=" * 60)
 
     set_seed(SEED)
-    processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+    # XLS-R 是純語音表示模型，沒有 CTC tokenizer，必須用 FeatureExtractor
+    processor = Wav2Vec2FeatureExtractor.from_pretrained(MODEL_NAME)
 
-    # ── 資料只準備一次 ──────────────────────────────────────
+    # ── 資料與特徵提取只做一次 ─────────────────────────────
     print("\n📦 載入資料集（只執行一次）...")
-    train_dataset_full, speaker_to_idx = load_audio_dataset(
-        TRAIN_CSV, is_train=True
-    )
-    test_dataset_raw, _ = load_audio_dataset(
+    train_dataset_full, speaker_to_idx = load_audio_dataset(TRAIN_CSV, is_train=True)
+    test_dataset_raw, _                = load_audio_dataset(
         TEST_CSV, speaker_to_idx=speaker_to_idx, is_train=False
     )
     num_speakers = len(speaker_to_idx)
     print(f"👥 共 {num_speakers} 位 speaker")
 
-    print("\n🔊 預處理音訊（只執行一次）...")
+    print("\n🔊 預處理音訊 + 提取 eGeMAPS（只執行一次，耗時較長）...")
     train_dataset_full = train_dataset_full.map(
         speech_file_to_array_fn, fn_kwargs={"processor": processor}
     )
@@ -475,38 +509,36 @@ if __name__ == "__main__":
         preprocess_function, fn_kwargs={"processor": processor}
     )
 
-    # ── TOTAL_RUNS 次實驗迴圈（修正 7） ────────────────────
+    # ── TOTAL_RUNS 次實驗迴圈 ──────────────────────────────
     all_results = []
     for run_i in range(1, TOTAL_RUNS + 1):
         print(f"\n{'='*60}")
         print(f"🎬 Run {run_i} / {TOTAL_RUNS}")
         print(f"{'='*60}")
 
-        set_seed(SEED + run_i)  # 每次 run 用不同 seed，確保隨機性
+        set_seed(SEED + run_i)
 
-        train_dataset = train_dataset_full
-        eval_dataset  = test_dataset
-        print(f"📊 Train: {len(train_dataset)} | Test(eval): {len(test_dataset)}")
+        train_dataset, eval_dataset = split_train_valid(
+            train_dataset_full, valid_ratio=0.15, seed=SEED + run_i
+        )
+        print(f"📊 Train: {len(train_dataset)} | Valid: {len(eval_dataset)} | Test: {len(test_dataset)}")
 
-        # 每次重新初始化模型（修正 6：config 設定 output_hidden_states）
+        # 每次重新初始化模型（修正 10：hidden_size XLS-R 為 1024）
         config = Wav2Vec2Config.from_pretrained(
             MODEL_NAME,
             num_labels=2,
             num_speakers=num_speakers,
             final_dropout=0.1,
-            output_hidden_states=True,   # 修正 6：讓 wav2vec2 輸出所有 hidden states
         )
-        model = Wav2Vec2_SLS_DANN.from_pretrained(MODEL_NAME, config=config)
+        model = XLSR_eGeMaps_DANN.from_pretrained(MODEL_NAME, config=config)
 
-        # 確認凍結狀態
-        frozen = sum(1 for p in model.wav2vec2.parameters() if not p.requires_grad)
-        total  = sum(1 for p in model.wav2vec2.parameters())
+        frozen    = sum(1 for p in model.wav2vec2.parameters() if not p.requires_grad)
+        total     = sum(1 for p in model.wav2vec2.parameters())
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"❄️  wav2vec2 凍結: {frozen}/{total} 個參數組")
         print(f"🔥 可訓練參數總量: {trainable:,}")
 
-        data_collator = DataCollatorWithSpeaker(processor=processor, padding=True)
-
+        data_collator  = DataCollatorWithEGeMAPSAndSpeaker(processor=processor, padding=True)
         run_output_dir = os.path.join(OUTPUT_DIR, f"run_{run_i}")
         os.makedirs(run_output_dir, exist_ok=True)
 
@@ -526,9 +558,8 @@ if __name__ == "__main__":
             seed=SEED + run_i,
             data_seed=SEED + run_i,
             load_best_model_at_end=True,
-            # metric_for_best_model 未設定 → 預設用 validation loss，對齊 train.py
+            # metric_for_best_model 未設定 → 預設用 validation loss
             report_to="none",
-            remove_unused_columns=False,  # 🔥 防止 Trainer 刪掉 speaker_labels
         )
 
         trainer = CTCTrainer(
@@ -538,7 +569,7 @@ if __name__ == "__main__":
             compute_metrics=compute_metrics,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=processor.feature_extractor,
+            tokenizer=processor,   # FeatureExtractor 本身即是 tokenizer 參數
         )
 
         print("⚔️ 開始訓練...")
@@ -551,17 +582,11 @@ if __name__ == "__main__":
                 continue
             raise e
 
-        # 儲存最佳模型
         best_path = os.path.join(run_output_dir, "best_model")
         trainer.save_model(best_path)
-        processor.save_pretrained(best_path)
+        processor.save_pretrained(best_path)   # FeatureExtractor 支援 save_pretrained
         print(f"💾 最佳模型儲存至: {best_path}")
 
-        pth_path = os.path.join(OUTPUT_DIR, f"huang_sls_dann_A_shared_encoder_run_{run_i}.pth")
-        torch.save(trainer.model.down_proj.state_dict(), pth_path)
-        print(f"🔑 down_proj .pth 儲存至: {pth_path}")
-
-        # 完整評估
         results = full_evaluation(trainer, test_dataset, OUTPUT_DIR, run_i)
         all_results.append(results)
 
@@ -575,4 +600,4 @@ if __name__ == "__main__":
             print(f"  {metric.upper():10s}  mean={np.mean(vals):.4f}  std={np.std(vals):.4f}  "
                   f"min={np.min(vals):.4f}  max={np.max(vals):.4f}")
 
-    print("\n🏁 Scenario A 實驗完成！")
+    print("\n🏁 Scenario B 實驗完成！")
